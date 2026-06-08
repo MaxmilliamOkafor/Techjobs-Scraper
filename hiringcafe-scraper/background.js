@@ -1,7 +1,14 @@
-// background.js — service worker (v1.9.5 — click-Apply-and-intercept, button-Apply prioritized over off-site anchor)
+// background.js — service worker (v2.0.0 — multi-site: hiring.cafe + eurotoptech.com)
 
 const STATE_KEY = "hiringcafe_state";
 const RESULTS_KEY = "hiringcafe_results";
+
+// Sites this extension can scrape. Add new sites here to extend support.
+const SITE_MATCHES = [
+  "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://eurotoptech.com/*", "https://*.eurotoptech.com/*"
+];
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|eurotoptech\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -17,7 +24,7 @@ let state = {
   status: "idle", pageIndex: 0, totalPages: null,
   scrapedThisPage: 0, totalScraped: 0, inFlight: 0,
   fetchHits: 0, tabHits: 0,
-  lastError: null, startedAt: null, finishedAt: null, activeTabId: null
+  lastError: null, startedAt: null, finishedAt: null, activeTabId: null, site: null
 };
 
 const activeAbortControllers = new Set();
@@ -231,7 +238,6 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
     }
     function check() {
       const anchors = Array.from(document.querySelectorAll("a"));
-      // 1) Visible <a> whose text starts with "Apply" — strongest signal.
       for (const a of anchors) {
         if (!isVisible(a)) continue;
         const txt = visText(a);
@@ -240,13 +246,6 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
           resolve({ href: a.href, label: txt, kind: "apply-anchor" }); return;
         }
       }
-      // 2) <button> whose text starts with "Apply" — capture any data-* URL or
-      //    report "button-no-href" so resolveByDetailPage can click it and
-      //    intercept the spawned ATS tab.
-      //
-      //    This MUST run before the broad off-site anchor fallback, otherwise
-      //    random footer / company-info links (reddit, company homepage,
-      //    glassdoor, etc.) on the hiring.cafe detail page would win first.
       const buttons = document.querySelectorAll("button");
       for (const b of buttons) {
         if (!isVisible(b)) continue;
@@ -262,8 +261,6 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
           resolve({ href: null, label: txt, kind: "button-no-href" }); return;
         }
       }
-      // 3) Last resort: ANY visible <a> with href pointing off hiring.cafe.
-      //    Only used when neither an Apply anchor nor an Apply button exists.
       let bestOff = null;
       for (const a of anchors) {
         if (!isVisible(a)) continue;
@@ -288,18 +285,14 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
 async function resolveByDetailPage(detailUrl) {
   if (cancelAll) return { ok: false, finalUrl: null, error: "cancelled" };
   if (!detailUrl) return { ok: false, finalUrl: null, error: "no detail url" };
-
   const winId = await ensureResolverWindow();
   let tabId = null;
-
   try {
     const opts = { url: detailUrl, active: false };
     if (winId != null) opts.windowId = winId;
-
     const tab = await chrome.tabs.create(opts);
     tabId = tab.id;
     activeResolverTabs.add(tabId);
-
     await new Promise((resolve) => {
       let done = false;
       const onUpdated = (id, ci) => {
@@ -314,47 +307,36 @@ async function resolveByDetailPage(detailUrl) {
       chrome.tabs.onUpdated.addListener(onUpdated);
       setTimeout(finish, DETAIL_LOAD_TIMEOUT_MS);
     });
-
     if (cancelAll) {
       return { ok: false, finalUrl: null, error: "cancelled" };
     }
-
     const inj = await chrome.scripting.executeScript({
       target: { tabId },
       func: findApplyNowOnDetailPage,
       args: [DETAIL_APPLY_POLL_INTERVAL_MS, DETAIL_APPLY_POLL_MAX_ATTEMPTS],
       world: "MAIN"
     });
-
     const r = inj && inj[0] && inj[0].result;
-
-    // Case 1: Apply now is a normal anchor or exposes a direct URL
     if (r && r.href) {
       return { ok: true, finalUrl: r.href, kind: r.kind, label: r.label };
     }
 
-    // Case 2: Apply now exists as a clickable button with no href/data-url.
-    // Click it, capture the spawned tab, wait for redirects to settle, then read its URL.
     if (r && r.kind === "button-no-href") {
       const spawned = await new Promise((resolve) => {
         let settled = false;
         let spawnedTabId = null;
         let quietTimer = null;
         const hardTimer = setTimeout(() => finish("timeout waiting for ATS tab"), TAB_RESOLVE_TIMEOUT_MS);
-
         const onCreated = (newTab) => {
           if (newTab.openerTabId === tabId) {
             spawnedTabId = newTab.id;
             activeResolverTabs.add(spawnedTabId);
           }
         };
-
         const onUpdated = (id, changeInfo, updatedTab) => {
           if (spawnedTabId == null) return;
           if (id !== spawnedTabId) return;
-
           if (quietTimer) clearTimeout(quietTimer);
-
           if (changeInfo.status === "complete" || changeInfo.url || (updatedTab && updatedTab.url)) {
             quietTimer = setTimeout(async () => {
               try {
@@ -367,7 +349,6 @@ async function resolveByDetailPage(detailUrl) {
             }, TAB_POST_LOAD_QUIET_MS + 400);
           }
         };
-
         function cleanup() {
           try { chrome.tabs.onCreated.removeListener(onCreated); } catch (_) {}
           try { chrome.tabs.onUpdated.removeListener(onUpdated); } catch (_) {}
@@ -376,23 +357,19 @@ async function resolveByDetailPage(detailUrl) {
             try { clearTimeout(quietTimer); } catch (_) {}
           }
         }
-
         async function finish(error, finalUrl = null) {
           if (settled) return;
           settled = true;
           cleanup();
-
           if (spawnedTabId != null) {
             try {
               activeResolverTabs.delete(spawnedTabId);
               await chrome.tabs.remove(spawnedTabId);
             } catch (_) {}
           }
-
           if (error) resolve({ ok: false, error, finalUrl: finalUrl || null });
           else resolve({ ok: true, error: null, finalUrl });
         }
-
         chrome.tabs.onCreated.addListener(onCreated);
         chrome.tabs.onUpdated.addListener(onUpdated);
 
@@ -402,13 +379,11 @@ async function resolveByDetailPage(detailUrl) {
           func: () => {
             const APPLY_RE = /^Apply\s*now\b/i;
             const SKIP_RE = /^(View All Jobs|Website|Full View|Save|Mark Applied|Hide Job|Report)\b/i;
-
             const all = Array.from(document.querySelectorAll("a, button"));
             for (const el of all) {
               const txt = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
               if (!txt || SKIP_RE.test(txt)) continue;
               if (!APPLY_RE.test(txt)) continue;
-
               try {
                 el.click();
                 return { clicked: true, tag: el.tagName.toLowerCase(), text: txt };
@@ -420,7 +395,6 @@ async function resolveByDetailPage(detailUrl) {
           }
         }).catch((e) => finish(e?.message || String(e)));
       });
-
       if (spawned.ok && spawned.finalUrl && !isAggregator(spawned.finalUrl)) {
         return {
           ok: true,
@@ -429,14 +403,12 @@ async function resolveByDetailPage(detailUrl) {
           label: r.label || "Apply now"
         };
       }
-
       return {
         ok: false,
         finalUrl: spawned.finalUrl || null,
         error: spawned.error || "apply now button did not open ATS url"
       };
     }
-
     return {
       ok: false,
       finalUrl: null,
@@ -455,12 +427,9 @@ async function resolveByDetailPage(detailUrl) {
 async function resolveJobUrl(initialUrl) {
   if (!initialUrl) return { ok: false, finalUrl: null, error: "empty url", method: "none" };
   if (cancelAll) return { ok: false, finalUrl: null, error: "cancelled", method: "none" };
-
   state.inFlight += 1; persistState();
   try {
     const startHost = hostOf(initialUrl);
-
-    // If input is a hiring.cafe URL → go straight to detail-page resolver.
     if (REDIRECT_HOSTS.has(startHost)) {
       await tabSem.acquire();
       let applyUrl = null, applyKind = "";
@@ -470,16 +439,12 @@ async function resolveJobUrl(initialUrl) {
         if (!d.ok) return { ...d, applyInitial: initialUrl, method: "detail-fail" };
         applyUrl = d.finalUrl; applyKind = d.kind || "";
       } finally { tabSem.release(); }
-
       if (cancelAll) return { ok: false, finalUrl: applyUrl, error: "cancelled", method: "detail" };
-
-      // Follow any redirects on the apply URL.
       const f = await fetchFollow(applyUrl);
       if (f.ok && f.finalUrl && !isAggregator(f.finalUrl)) {
         state.fetchHits += 1;
         return { ok: true, finalUrl: f.finalUrl, applyInitial: applyUrl, method: "detail+fetch", kind: applyKind };
       }
-      // Tab fallback only if fetch failed or stayed on aggregator.
       if (cancelAll) return { ok: false, finalUrl: f.finalUrl || applyUrl, error: "cancelled", method: "detail+fetch" };
       await tabSem.acquire();
       try {
@@ -489,8 +454,6 @@ async function resolveJobUrl(initialUrl) {
         return { ok: t.ok && !isAggregator(t.finalUrl), finalUrl: t.finalUrl, applyInitial: applyUrl, method: t.ok ? "detail+tab" : ("detail+tab:" + (t.error || "fail")), kind: applyKind };
       } finally { tabSem.release(); }
     }
-
-    // Otherwise: plain fetch-follow → tab fallback.
     const f = await fetchFollow(initialUrl);
     if (f.ok && f.finalUrl && !isAggregator(f.finalUrl)) {
       state.fetchHits += 1;
@@ -521,6 +484,20 @@ async function abortAllResolutions() {
 }
 function resetCancelFlag() { cancelAll = false; }
 
+async function findTargetTab(preferTabId) {
+  const tabs = await chrome.tabs.query({ url: SITE_MATCHES });
+  if (!tabs.length) return null;
+  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  if (preferTabId) { const m = tabs.find((t) => t.id === preferTabId); if (m) return m; }
+  return tabs[0];
+}
+function siteLabelFor(url) {
+  const h = hostOf(url);
+  if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
+  return h || null;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
@@ -532,15 +509,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         case "START_SCRAPE": {
-          const tabs = await chrome.tabs.query({ url: ["https://hiring.cafe/*", "https://*.hiring.cafe/*"] });
-          if (!tabs.length) { sendResponse({ ok: false, error: "Open hiring.cafe in a tab first." }); return; }
-          tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-          const target = tabs[0];
+          const target = await findTargetTab();
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe or eurotoptech.com in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
           state.startedAt = Date.now();
           state.activeTabId = target.id;
+          state.site = siteLabelFor(target.url);
           state.fetchHits = 0; state.tabHits = 0;
           persistState();
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
@@ -571,6 +547,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "CLEAR_RESULTS": { await clearResults(); sendResponse({ ok: true }); return; }
         case "RESOLVE_URL": { const r = await resolveJobUrl(msg.url); sendResponse(r); return; }
         case "JOB_SCRAPED": { bufferRow(msg.row); sendResponse({ ok: true }); return; }
+
         case "PAGE_PROGRESS": {
           state.pageIndex = msg.pageIndex ?? state.pageIndex;
           state.totalPages = msg.totalPages ?? state.totalPages;
@@ -598,15 +575,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         case "START_PICKER": {
-          const tabs = await chrome.tabs.query({ url: ["https://hiring.cafe/*", "https://*.hiring.cafe/*"] });
-          if (!tabs.length) { sendResponse({ ok: false, error: "Open hiring.cafe in a tab first." }); return; }
-          tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
-          const target = msg.tabId ? (tabs.find((t) => t.id === msg.tabId) || tabs[0]) : tabs[0];
-          try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER" }); }
+          const target = await findTargetTab(msg.tabId);
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe or eurotoptech.com in a tab first." }); return; }
+          try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {
               await chrome.scripting.executeScript({ target: { tabId: target.id }, files: ["content.js"] });
-              await chrome.tabs.sendMessage(target.id, { type: "START_PICKER" });
+              await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode });
             } catch (e) {
               sendResponse({ ok: false, error: "Could not start picker: " + (e?.message || e) });
               return;
@@ -616,7 +591,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         case "ELEMENT_PICKED": {
-          chrome.runtime.sendMessage({ type: "ELEMENT_PICKED", spec: msg.spec }).catch(() => {});
+          chrome.runtime.sendMessage({ type: "ELEMENT_PICKED", spec: msg.spec, mode: msg.mode }).catch(() => {});
           sendResponse({ ok: true });
           return;
         }
