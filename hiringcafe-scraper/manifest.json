@@ -1,15 +1,15 @@
 {
   "manifest_version": 3,
-  "name": "HiringCafe Job URL Scraper",
-  "version": "1.9.5",
-  "description": "Click-Apply-and-intercept resolver, with button-Apply prioritized over off-site anchor fallback.",
+  "name": "Tech Jobs URL Scraper",
+  "version": "1.10.0",
+  "description": "Scrapes job listings and resolves real external apply URLs from hiring.cafe and eurotoptech.com.",
   "permissions": ["tabs", "storage", "scripting", "activeTab", "sidePanel"],
-  "host_permissions": ["https://hiring.cafe/*", "https://*.hiring.cafe/*", "<all_urls>"],
+  "host_permissions": ["https://hiring.cafe/*", "https://*.hiring.cafe/*", "https://eurotoptech.com/*", "https://*.eurotoptech.com/*", "<all_urls>"],
   "background": { "service_worker": "background.js" },
-  "action": { "default_title": "HiringCafe Scraper" },
+  "action": { "default_title": "Tech Jobs Scraper" },
   "side_panel": { "default_path": "popup.html" },
   "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
   "content_scripts": [
-    { "matches": ["https://hiring.cafe/*", "https://*.hiring.cafe/*"], "js": ["content.js"], "run_at": "document_idle" }
+    { "matches": ["https://hiring.cafe/*", "https://*.hiring.cafe/*", "https://eurotoptech.com/*", "https://*.eurotoptech.com/*"], "js": ["content.js"], "run_at": "document_idle" }
   ]
 }
