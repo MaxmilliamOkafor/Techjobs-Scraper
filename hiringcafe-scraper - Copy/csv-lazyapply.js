@@ -7,14 +7,16 @@
   // LazyApply dashboard. We drive whichever tab is open on this origin.
   const LAZYAPPLY_MATCH = ["https://app.lazyapply.com/*"];
 
-  // A Job URL is kept ONLY if it contains one of these. Everything else
-  // (LinkedIn, Workday, SmartRecruiters, Personio, Indeed, …) is ignored.
+  // A Job URL is kept ONLY if it is one of the four supported ATS platforms.
+  // Matched at the platform-domain level so every subdomain LazyApply accepts
+  // is caught: greenhouse.io covers job-boards / boards / company / *.eu, etc.
+  // Everything else (LinkedIn, Workday, SmartRecruiters, Personio, Indeed, …)
+  // is ignored.
   const ATS_PATTERNS = [
-    /job-boards\.greenhouse\.io/i,
-    /job-boards\.eu\.greenhouse\.io/i,
-    /jobs\.lever\.co/i,
-    /jobs\.ashbyhq\.com/i,
-    /ats\.rippling\.com/i,
+    /\bgreenhouse\.io/i, // job-boards / boards / company .greenhouse.io (incl. .eu)
+    /\blever\.co/i, // jobs.lever.co
+    /\bashbyhq\.com/i, // jobs.ashbyhq.com
+    /\brippling\.com/i, // ats.rippling.com
   ];
   const isSupported = (url) => ATS_PATTERNS.some((re) => re.test(url));
 
@@ -70,29 +72,24 @@
     return rows;
   }
 
-  // Locate the "Job URL" column. Falls back to any header containing "url".
-  function findUrlColumn(header) {
-    const norm = header.map((h) => (h || "").trim().toLowerCase());
-    const exact = norm.indexOf("job url");
-    if (exact !== -1) return exact;
-    return norm.findIndex(
-      (h) => h === "url" || h === "job posting (final url)" || h.includes("url")
-    );
-  }
-
+  // Scan EVERY cell of EVERY row for URLs, then keep only the supported ATS
+  // ones. This is column-name, layout and delimiter independent — we filter by
+  // platform regardless, so a "Job URL" header isn't required and a header row
+  // (no URLs in it) is skipped naturally. The URL char class excludes , ; and "
+  // so semicolon-delimited exports still yield clean URLs.
   function extractUrls(text) {
     const rows = parseCsv(text).filter((r) => r.some((c) => c && c.trim()));
-    if (!rows.length) return [];
-    const col = findUrlColumn(rows[0]);
     const out = [];
-    const start = col === -1 ? 0 : 1; // no header match → scan every row/cell
-    for (let r = start; r < rows.length; r++) {
-      const cells = col === -1 ? rows[r] : [rows[r][col]];
-      for (const cell of cells) {
+    const re = /https?:\/\/[^\s",;]+/gi;
+    for (const row of rows) {
+      for (const cell of row) {
         if (!cell) continue;
-        const m = String(cell).match(/https?:\/\/[^\s",]+/);
-        let url = (m ? m[0] : String(cell).trim()).replace(/[)\].,;]+$/, "");
-        if (url && isSupported(url)) out.push(url);
+        const matches = String(cell).match(re);
+        if (!matches) continue;
+        for (let u of matches) {
+          u = u.replace(/[)\].,;>]+$/, ""); // trim trailing punctuation/markup
+          if (isSupported(u)) out.push(u);
+        }
       }
     }
     return out;
@@ -204,12 +201,13 @@
 
     // Wait for React to re-render and enable the button. A button that stays
     // disabled means the input event didn't register yet → re-fire and retry.
+    // Poll fast (40ms) so large lists move quickly.
     let btn = null;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      await sleep(150);
+    for (let attempt = 0; attempt < 15; attempt++) {
+      await sleep(40);
       btn = findAddButton(input);
       if (btn && !btn.disabled) break;
-      fire("input"); // nudge React again
+      if (attempt % 3 === 2) fire("input"); // nudge React again periodically
     }
 
     if (!btn) {
@@ -223,10 +221,11 @@
     btn.click();
 
     // Confirmation: on a successful add MUI clears the field and the button
-    // returns to disabled. Poll for that (up to ~2.5s) as the success signal.
+    // returns to disabled. Poll fast (40ms, ~1s cap) as the success signal so
+    // we don't stall the loop on large lists.
     let confirmed = false;
     for (let i = 0; i < 25; i++) {
-      await sleep(100);
+      await sleep(40);
       const cur = findInput();
       if ((cur && cur.value === "") || btn.disabled) { confirmed = true; break; }
     }
@@ -256,7 +255,7 @@
     els.dropzone.classList.add("disabled");
 
     const raw = parseInt(els.delayInput?.value, 10);
-    const delay = Math.max(0, Number.isFinite(raw) ? raw : 250);
+    const delay = Math.max(0, Number.isFinite(raw) ? raw : 0);
     let added = 0;
     const failed = [];
     log(`\n▶ Adding ${masterList.length} URL(s) — ~${delay}ms apart.\n`);
