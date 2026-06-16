@@ -134,31 +134,44 @@
 
   // ---- Page automation (runs in the LazyApply tab) -----------------------
   // Serialized & injected via chrome.scripting.executeScript — must be a pure
-  // function with no closure over module scope.
-  function addUrlToQueueInPage(url) {
+  // (async) function with no closure over module scope. The page is a MUI/React
+  // app: the "Add to Queue" button is disabled until a React-tracked `input`
+  // event fires, and on a successful add MUI clears the field and re-disables
+  // the button — which we use as a clean confirmation signal.
+  async function addUrlToQueueInPage(url) {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
     function findInput() {
-      const inputs = Array.from(document.querySelectorAll("input, textarea"));
-      let el = inputs.find((i) =>
-        /greenhouse|lever|ashby|rippling|job.*queue|queue|paste|job url|job posting/i.test(
-          (i.getAttribute("placeholder") || "") + " " + (i.getAttribute("aria-label") || "")
-        )
-      );
-      if (el) return el;
+      // The placeholder is the only stable, unique anchor (ids like ":r7:" and
+      // css-hash classes are regenerated on every render/build).
       return (
-        inputs.find((i) => {
-          if (i.type && !/^(text|url|search|)$/i.test(i.type)) return false;
-          const r = i.getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        }) || null
+        document.querySelector('input[placeholder^="https://company.greenhouse.io/jobs"]') ||
+        document.querySelector('input[placeholder*="greenhouse.io/jobs"]') ||
+        (function () {
+          const inputs = Array.from(document.querySelectorAll("input, textarea"));
+          return (
+            inputs.find((i) =>
+              /greenhouse|lever|ashby|rippling|job.*queue|queue|paste|job url|job posting/i.test(
+                (i.getAttribute("placeholder") || "") + " " + (i.getAttribute("aria-label") || "")
+              )
+            ) ||
+            inputs.find((i) => {
+              if (i.type && !/^(text|url|search|)$/i.test(i.type)) return false;
+              const r = i.getBoundingClientRect();
+              return r.width > 0 && r.height > 0;
+            }) ||
+            null
+          );
+        })()
       );
     }
     function findAddButton(input) {
       const btns = Array.from(
         document.querySelectorAll('button, [role="button"], input[type="submit"]')
       );
-      let b = btns.find((x) =>
-        /add to queue|add job|add url|^\s*\+?\s*add\s*$/i.test((x.textContent || x.value || "").trim())
-      );
+      let b = btns.find((x) => /add to queue/i.test((x.textContent || "").trim()));
+      if (b) return b;
+      b = btns.find((x) => /add job|add url|^\s*\+?\s*add\s*$/i.test((x.textContent || x.value || "").trim()));
       if (b) return b;
       if (input) {
         const scope = input.closest("form, div");
@@ -178,30 +191,46 @@
     const proto =
       input.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+    const fire = (type) => input.dispatchEvent(new Event(type, { bubbles: true }));
     const setVal = (v) => {
       try { setter.call(input, v); } catch (_) { input.value = v; }
-      input.dispatchEvent(new Event("input", { bubbles: true }));
-      input.dispatchEvent(new Event("change", { bubbles: true }));
+      fire("input"); // React-tracked
     };
 
     input.focus();
-    setVal(""); // clear any existing text
-    setVal(url);
+    setVal(""); // clear any existing text first (empty input event)
+    setVal(url); // then set the URL
+    fire("change");
 
-    const btn = findAddButton(input);
-    if (!btn) {
-      // No button — try submitting with Enter as a fallback.
-      input.dispatchEvent(
-        new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true })
-      );
-      input.dispatchEvent(
-        new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true })
-      );
-      return { ok: true, via: "enter" };
+    // Wait for React to re-render and enable the button. A button that stays
+    // disabled means the input event didn't register yet → re-fire and retry.
+    let btn = null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await sleep(150);
+      btn = findAddButton(input);
+      if (btn && !btn.disabled) break;
+      fire("input"); // nudge React again
     }
-    if (btn.disabled) return { ok: false, error: "Add button is disabled (URL may be rejected)" };
+
+    if (!btn) {
+      // No button at all — fall back to submitting with Enter.
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+      return { ok: true, via: "enter", confirmed: false };
+    }
+    if (btn.disabled) return { ok: false, error: "Add button stayed disabled (URL rejected by page)" };
+
     btn.click();
-    return { ok: true, via: "click" };
+
+    // Confirmation: on a successful add MUI clears the field and the button
+    // returns to disabled. Poll for that (up to ~2.5s) as the success signal.
+    let confirmed = false;
+    for (let i = 0; i < 25; i++) {
+      await sleep(100);
+      const cur = findInput();
+      if ((cur && cur.value === "") || btn.disabled) { confirmed = true; break; }
+    }
+    return { ok: true, via: "click", confirmed };
   }
 
   async function findLazyApplyTab() {
@@ -226,7 +255,8 @@
     els.fileInput.disabled = true;
     els.dropzone.classList.add("disabled");
 
-    const delay = Math.max(150, parseInt(els.delayInput?.value, 10) || 700);
+    const raw = parseInt(els.delayInput?.value, 10);
+    const delay = Math.max(0, Number.isFinite(raw) ? raw : 250);
     let added = 0;
     const failed = [];
     log(`\n▶ Adding ${masterList.length} URL(s) — ~${delay}ms apart.\n`);
@@ -244,7 +274,7 @@
         const r = res && res.result;
         if (r && r.ok) {
           added++;
-          log(`Adding ${i + 1}/${masterList.length} ✓  ${url}`);
+          log(`Adding ${i + 1}/${masterList.length} ✓${r.confirmed ? "" : " (unconfirmed)"}  ${url}`);
         } else {
           failed.push({ url, error: (r && r.error) || "unknown" });
           log(`Adding ${i + 1}/${masterList.length} ✗  ${url}  — ${(r && r.error) || "failed"}`);
