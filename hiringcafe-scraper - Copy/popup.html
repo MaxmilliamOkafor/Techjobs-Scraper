@@ -94,6 +94,27 @@
     </div>
   </section>
 
+  <section id="csv-card">
+    <div class="card-title">CSV → LazyApply Queue</div>
+    <div id="csv-dropzone" tabindex="0" role="button" aria-label="Upload or drop CSV files">
+      <span>Drag &amp; drop CSV file(s) here<br />or <b>click to browse</b></span>
+    </div>
+    <input type="file" id="csv-file-input" accept=".csv,.txt" multiple hidden />
+    <pre id="csv-summary" class="csv-summary" aria-live="polite"></pre>
+    <div class="csv-delay-row">
+      <label for="csv-delay">Extra delay between adds (ms)</label>
+      <input type="number" id="csv-delay" value="250" min="0" step="50" />
+    </div>
+    <div class="actions csv-actions">
+      <button id="csv-start-btn" class="primary" disabled>Add to LazyApply Queue</button>
+      <button id="csv-stop-btn" class="ghost" disabled>Stop</button>
+    </div>
+    <div class="progress-track" role="progressbar" aria-label="Queue add progress">
+      <div id="csv-progress-bar" class="progress-bar"></div>
+    </div>
+    <pre id="csv-log" class="csv-log" aria-live="polite"></pre>
+  </section>
+
   <footer>
     <p class="hint">
       Open
@@ -104,5 +125,6 @@
   </footer>
 
   <script src="popup.js"></script>
+  <script src="csv-lazyapply.js"></script>
 </body>
 </html>
