@@ -17,6 +17,7 @@
     "https://*.eurotoptech.com/*",
     "https://simplify.jobs/*",
     "https://*.simplify.jobs/*",
+    "https://app.lazyapply.com/*",
     "<all_urls>"
   ],
   "background": {

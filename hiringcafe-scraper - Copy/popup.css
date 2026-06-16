@@ -218,6 +218,69 @@ button.ghost {
 }
 button.ghost:hover:not(:disabled) { color: var(--text); background: var(--panel); }
 
+/* CSV → LazyApply Queue */
+#csv-card {
+  margin: 8px 16px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+#csv-dropzone {
+  display: flex; align-items: center; justify-content: center; text-align: center;
+  min-height: 64px;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11.5px; line-height: 1.5;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+#csv-dropzone b { color: var(--text); }
+#csv-dropzone:hover:not(.disabled) { border-color: var(--accent); color: var(--text); }
+#csv-dropzone.dragover {
+  border-color: var(--accent);
+  background: rgba(168, 85, 247, 0.12);
+  color: var(--text);
+}
+#csv-dropzone.disabled { opacity: 0.5; cursor: not-allowed; }
+
+.csv-summary, .csv-log {
+  margin: 9px 0 0;
+  padding: 9px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px; line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap; word-break: break-word;
+}
+.csv-summary:empty, .csv-log:empty { display: none; }
+.csv-log { max-height: 180px; overflow-y: auto; color: var(--muted); }
+
+.csv-delay-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-top: 10px;
+  font-size: 11.5px; color: var(--muted);
+}
+.csv-delay-row input {
+  width: 84px;
+  padding: 7px 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.csv-delay-row input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.csv-actions { padding: 10px 0 4px; }
+#csv-card .progress-track { margin-top: 6px; margin-bottom: 0; }
+
 footer {
   padding: 10px 16px 14px;
   border-top: 1px solid var(--border);
