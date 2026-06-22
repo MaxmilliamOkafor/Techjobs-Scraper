@@ -1,4 +1,7 @@
 // content.js — hiring.cafe + eurotoptech.com + simplify.jobs
+// v2.3.0 — the exported "Job URL" column now only ever holds a resolved external
+//          ATS link; aggregator links (hiring.cafe/job/...) are never stored —
+//          unresolved rows are left blank and flagged in the status column.
 // v2.1.0 — fixed card boundary, title/company extraction, "X or Y" locations,
 //          multi-currency (€/£/$) salary; single clean copy (duplicate removed).
 
@@ -20,6 +23,14 @@
   let pickerMode = "pagination"; // or "column"
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Aggregator hosts that must NEVER survive into the exported "Job URL" column —
+  // a real ATS link (greenhouse/lever/workday/etc.) is the only acceptable value.
+  // If resolution returns one of these (or fails), the URL is treated as unresolved.
+  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+  function isResolvedExternalUrl(u) {
+    if (!u || !/^https?:\/\//i.test(u)) return false;
+    try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
+  }
   function send(type, payload = {}) {
     return new Promise((resolve) => {
       try {
@@ -510,14 +521,15 @@
       if (row.job_posting_initial_url) {
         const r = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
         if (r) {
-          if (r.ok) {
-            row.url = r.finalUrl || row.job_posting_initial_url;
+          row.method = r.method || "";
+          if (r.ok && isResolvedExternalUrl(r.finalUrl)) {
+            row.url = r.finalUrl;
             row.status = "ok";
-            row.method = r.method || "";
           } else {
-            row.url = r.finalUrl || row.job_posting_initial_url;
-            row.status = "error: " + (r.error || "unknown");
-            row.method = r.method || "";
+            // Resolution failed (or returned an aggregator link) — never fall back
+            // to the hiring.cafe URL. Leave url blank and flag it for review.
+            row.url = "";
+            row.status = "unresolved: " + (r.error || "no external url");
           }
         } else { row.status = "no response"; }
       }
@@ -968,9 +980,14 @@ async function sjRun() {
       if (row.job_posting_initial_url) {
         const resp = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
         if (resp) {
-          row.url = resp.finalUrl || row.job_posting_initial_url;
-          row.status = resp.ok ? "ok" : ("error: " + (resp.error || "unknown"));
           row.method = resp.method || "";
+          if (resp.ok && isResolvedExternalUrl(resp.finalUrl)) {
+            row.url = resp.finalUrl;
+            row.status = "ok";
+          } else {
+            row.url = "";
+            row.status = "unresolved: " + (resp.error || "no external url");
+          }
         } else row.status = "no response";
       }
       await send("JOB_SCRAPED", { row });
