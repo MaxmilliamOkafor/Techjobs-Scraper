@@ -555,13 +555,13 @@
   const MAX_PAGINATION_PAGES = 100;
   async function runPagination(options) {
     const seen = new Set();          // job keys captured this run (cross-page dedup)
-    let pageIndex = 0;
-    let emptyStreak = 0;             // consecutive advances that produced no new jobs
-    while (!aborted && pageIndex < MAX_PAGINATION_PAGES) {
-      pageIndex += 1;
-      const paginationEl = findPagination();
-      const totalPages = getTotalPages(paginationEl);
-      const currentPage = getCurrentPageNumber(paginationEl) ?? pageIndex;
+    let page = 0;                    // how many pages we've visited (1-based once inside)
+    let totalPages = getTotalPages(findPagination()); // e.g. 3 — reliable (max numbered btn)
+    let emptyStreak = 0;             // consecutive pages that produced no new jobs
+    while (!aborted && page < MAX_PAGINATION_PAGES) {
+      page += 1;
+      // Make sure cards for this page have actually rendered before scraping.
+      await waitForCardsToExist();
       const allCards = findJobCards();
       const sigBefore = cardSignature(allCards);
       // Only scrape jobs we haven't already captured — a relevance reshuffle of
@@ -573,26 +573,29 @@
         seen.add(k);
         return true;
       });
-      if (newCards.length) {
-        emptyStreak = 0;
-        await scrapeCards(newCards, currentPage, totalPages);
-      } else {
-        emptyStreak += 1;
-      }
+      if (newCards.length) { emptyStreak = 0; await scrapeCards(newCards, page, totalPages); }
+      else emptyStreak += 1;
       if (aborted) break;
-      // Stop when the known last page is reached.
-      if (totalPages && currentPage >= totalPages) return;
-      // Stop if advancing keeps yielding nothing new (end of list, or a control
-      // that just reshuffles/reloads the same jobs).
-      if (emptyStreak >= 2) return;
+      // Keep totalPages current — the control may reveal more pages as we go.
+      const tpNow = getTotalPages(findPagination());
+      if (tpNow) totalPages = Math.max(totalPages || 0, tpNow);
+      // PRIMARY stop: we've visited every numbered page. Driven by our own page
+      // counter (one click per loop), NOT the flaky "current page" heuristic that
+      // was stopping a page early.
+      if (totalPages && page >= totalPages) return;
+      // SAFETY stop: several pages in a row yielded nothing new (true end of list,
+      // or a control that only reshuffles). Higher threshold so a single
+      // overlap-heavy page can't end the run prematurely.
+      if (emptyStreak >= 3) return;
       let nextEl = null;
       if (options.paginationSpec) nextEl = findByElementSpec(options.paginationSpec);
-      if (!nextEl) nextEl = autoDetectNextButton(paginationEl);
-      if (!nextEl) return;
+      if (!nextEl) nextEl = autoDetectNextButton(findPagination());
+      if (!nextEl) return;            // no next control -> last page reached
       clickAt(nextEl);
       await sleep(POST_CLICK_GRACE_MS);
-      const changed = await waitForCardsToChange(sigBefore);
-      if (!changed) return;
+      // Wait for the page to turn over. Even if this times out (slow page 3), we
+      // do NOT bail — the next loop re-reads cards and dedup handles any overlap.
+      await waitForCardsToChange(sigBefore);
     }
   }
 
