@@ -116,6 +116,14 @@
     }
     return null;
   }
+  // Stable identity for a job card, used to dedupe across pages so a relevance
+  // reshuffle (same jobs, new order) can't make pagination loop forever.
+  function cardKey(card) {
+    const a = getJobPostingAnchor(card);
+    if (a && a.href) return a.href;
+    const t = (getTitle(card) + "|" + getCompanyName(card)).trim();
+    return t === "|" ? "" : t;
+  }
   // Title = largest non-company, non-action, non-meta text leaf.
   // hiring.cafe cards have no h1-h6, so the font-size heuristic carries the
   // load - but we now exclude the company name and time/YOE chips so the
@@ -543,17 +551,40 @@
     }));
   }
 
+  // Hard safety cap so a misbehaving "next" control can never scrape forever.
+  const MAX_PAGINATION_PAGES = 100;
   async function runPagination(options) {
+    const seen = new Set();          // job keys captured this run (cross-page dedup)
     let pageIndex = 0;
-    while (!aborted) {
+    let emptyStreak = 0;             // consecutive advances that produced no new jobs
+    while (!aborted && pageIndex < MAX_PAGINATION_PAGES) {
       pageIndex += 1;
       const paginationEl = findPagination();
       const totalPages = getTotalPages(paginationEl);
       const currentPage = getCurrentPageNumber(paginationEl) ?? pageIndex;
-      const cardsBefore = findJobCards();
-      const sigBefore = cardSignature(cardsBefore);
-      await scrapeCards(cardsBefore, currentPage, totalPages);
+      const allCards = findJobCards();
+      const sigBefore = cardSignature(allCards);
+      // Only scrape jobs we haven't already captured — a relevance reshuffle of
+      // the same jobs (hiring.cafe does this) must not be re-scraped or recounted.
+      const newCards = allCards.filter((c) => {
+        const k = cardKey(c);
+        if (!k) return true;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      if (newCards.length) {
+        emptyStreak = 0;
+        await scrapeCards(newCards, currentPage, totalPages);
+      } else {
+        emptyStreak += 1;
+      }
       if (aborted) break;
+      // Stop when the known last page is reached.
+      if (totalPages && currentPage >= totalPages) return;
+      // Stop if advancing keeps yielding nothing new (end of list, or a control
+      // that just reshuffles/reloads the same jobs).
+      if (emptyStreak >= 2) return;
       let nextEl = null;
       if (options.paginationSpec) nextEl = findByElementSpec(options.paginationSpec);
       if (!nextEl) nextEl = autoDetectNextButton(paginationEl);

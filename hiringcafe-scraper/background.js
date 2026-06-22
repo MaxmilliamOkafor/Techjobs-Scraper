@@ -172,7 +172,11 @@ async function fetchFollow(url) {
 // first so a single set of patterns covers both shapes, and we try several known
 // key names. Self-referential hiring.cafe values are rejected so they never leak
 // into the exported "url" column.
-const HIRINGCAFE_APPLY_KEYS = ["apply_url", "applyUrl", "externalApplyUrl", "apply_link", "applyLink", "external_apply_url"];
+const HIRINGCAFE_APPLY_KEYS = ["apply_url", "applyUrl", "externalApplyUrl", "apply_link", "applyLink", "external_apply_url", "applicationUrl", "application_url", "job_url", "jobUrl"];
+// Known ATS / job-application providers. Used as a last-resort fallback: if no
+// apply_url key matches (e.g. hiring.cafe renamed the field), the first link in
+// the page pointing at one of these is almost certainly the real apply target.
+const ATS_HOST_RE = /(^|\.)(greenhouse\.io|lever\.co|ashbyhq\.com|myworkdayjobs\.com|myworkdaysite\.com|workable\.com|bamboohr\.com|icims\.com|taleo\.net|successfactors\.com|smartrecruiters\.com|jobvite\.com|breezy\.hr|recruitee\.com|teamtailor\.com|rippling\.com|eightfold\.ai|paylocity\.com|dayforcehcm\.com|oraclecloud\.com|ultipro\.com)$|(^|\.)(personio\.(?:com|de))$|workforcenow\.adp\.com$/i;
 function extractApplyUrlFromHtml(html) {
   if (!html) return null;
   // Collapse JSON-string and unicode escaping so both embedding shapes look alike.
@@ -190,6 +194,12 @@ function extractApplyUrlFromHtml(html) {
       // Never return an internal hiring.cafe link — let resolution fall through.
       if (!SITE_HOST_RE.test(hostOf(v))) return v;
     }
+  }
+  // Fallback: first link anywhere in the page that targets a known ATS host.
+  const urls = normalized.match(/https?:\/\/[^"'\s<>\\)]+/gi) || [];
+  for (const u of urls) {
+    const h = hostOf(u);
+    if (h && !SITE_HOST_RE.test(h) && ATS_HOST_RE.test(h)) return u;
   }
   return null;
 }
