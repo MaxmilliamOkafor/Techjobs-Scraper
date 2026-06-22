@@ -1,4 +1,7 @@
-// background.js — service worker (v2.2.0 — multi-site: hiring.cafe + eurotoptech.com + simplify.jobs)
+// background.js — service worker (v2.3.0 — multi-site: hiring.cafe + eurotoptech.com + simplify.jobs)
+// v2.3.0: URL resolution is fetch-only (no browser tabs are ever opened), and the
+// hiring.cafe apply_url extractor now handles both the Pages Router (__NEXT_DATA__)
+// and App Router (RSC flight) embeddings so the real employer ATS URL is captured.
 
 const STATE_KEY = "hiringcafe_state";
 const RESULTS_KEY = "hiringcafe_results";
@@ -157,9 +160,39 @@ async function fetchFollow(url) {
   } finally { activeAbortControllers.delete(ctrl); }
 }
 
-// FAST PATH for hiring.cafe: the real employer URL is server-rendered into the
-// job detail page's __NEXT_DATA__ JSON as "apply_url". A single fetch gets it —
-// no hidden tab, no clicking a hrefless "Apply now" button, no popup race.
+// Pull the real employer apply URL out of a hiring.cafe detail page's embedded
+// JSON. hiring.cafe is a Next.js app and embeds the job object in one of two
+// shapes depending on which router served the page:
+//   1. Pages Router  -> <script id="__NEXT_DATA__"> with plain JSON: "apply_url":"https://..."
+//   2. App Router/RSC -> self.__next_f.push([1,"...flight..."]) where the JSON is a
+//      JS *string literal*, so every quote/slash is backslash-escaped:
+//      \"apply_url\":\"https:\/\/...\"
+// The old extractor only matched shape (1); shape (2) silently failed and the
+// scraper fell back to the internal hiring.cafe URL. We now normalise the escapes
+// first so a single set of patterns covers both shapes, and we try several known
+// key names. Self-referential hiring.cafe values are rejected so they never leak
+// into the exported "url" column.
+const HIRINGCAFE_APPLY_KEYS = ["apply_url", "applyUrl", "externalApplyUrl", "apply_link", "applyLink", "external_apply_url"];
+function extractApplyUrlFromHtml(html) {
+  if (!html) return null;
+  // Collapse JSON-string and unicode escaping so both embedding shapes look alike.
+  const normalized = html
+    .replace(/\\u002[fF]/gi, "/")   // / -> /
+    .replace(/\\u0026/gi, "&")       // & -> &
+    .replace(/\\\//g, "/")           // \/ -> /
+    .replace(/\\"/g, '"')            // \" -> "  (RSC flight string literals)
+    .replace(/&amp;/g, "&");
+  for (const key of HIRINGCAFE_APPLY_KEYS) {
+    const re = new RegExp('"' + key + '"\\s*:\\s*"(https?:\\/\\/[^"\\\\\\s]+)"', "i");
+    const m = normalized.match(re);
+    if (m) {
+      const v = m[1];
+      // Never return an internal hiring.cafe link — let resolution fall through.
+      if (!SITE_HOST_RE.test(hostOf(v))) return v;
+    }
+  }
+  return null;
+}
 async function resolveHiringCafeApplyUrl(detailUrl) {
   if (cancelAll) return { ok: false, finalUrl: null, error: "cancelled" };
   const ctrl = new AbortController();
@@ -172,13 +205,8 @@ async function resolveHiringCafeApplyUrl(detailUrl) {
     });
     const html = await resp.text();
     clearTimeout(timer);
-    const unescape = (s) => s.replace(/\\u002[fF]/g, "/").replace(/\\\//g, "/").replace(/&amp;/g, "&");
-    let applyUrl = null;
-    const nd = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-    const scope = nd ? nd[1] : html;
-    const m = scope.match(/"apply_url"\s*:\s*"([^"]+)"/);
-    if (m) applyUrl = unescape(m[1]);
-    return (applyUrl && /^https?:\/\//i.test(applyUrl))
+    const applyUrl = extractApplyUrlFromHtml(html);
+    return applyUrl
       ? { ok: true, finalUrl: applyUrl }
       : { ok: false, finalUrl: null, error: "apply_url not found in detail page" };
   } catch (e) {
@@ -474,81 +502,50 @@ async function resolveByDetailPage(detailUrl) {
   }
 }
 
+// Fast-path-only resolver: NEVER opens a browser tab. Every branch resolves the
+// employer URL with fetch alone, so a large scrape can't flood the machine with
+// hidden tabs. The few listings that genuinely need a JS-driven redirect are
+// returned with the initial URL and a clear "no-tab" status for manual review,
+// instead of silently storing a hiring.cafe link in the exported "url" column.
 async function resolveJobUrl(initialUrl) {
   if (!initialUrl) return { ok: false, finalUrl: null, error: "empty url", method: "none" };
   if (cancelAll) return { ok: false, finalUrl: null, error: "cancelled", method: "none" };
   state.inFlight += 1; persistState();
   try {
     const startHost = hostOf(initialUrl);
+
+    // hiring.cafe — read the employer URL straight from the detail page's
+    // embedded JSON ("apply_url"). One fetch, no tab/popup.
     if (REDIRECT_HOSTS.has(startHost)) {
-      // FAST PATH: read the employer URL straight from the detail page's
-      // __NEXT_DATA__ ("apply_url"). One fetch, no tab/popup. Only if this
-      // fails do we fall back to the original tab-based detail resolution.
       const fast = await resolveHiringCafeApplyUrl(initialUrl);
       if (fast.ok && fast.finalUrl) {
         const ff = await fetchFollow(fast.finalUrl);
         const finalUrl = (ff.ok && ff.finalUrl && !isAggregator(ff.finalUrl)) ? ff.finalUrl : fast.finalUrl;
         state.fetchHits += 1;
-        return { ok: true, finalUrl, applyInitial: fast.finalUrl, method: "detail-nextdata" };
+        return { ok: true, finalUrl: cleanFinalUrl(finalUrl), applyInitial: fast.finalUrl, method: "detail-nextdata" };
       }
-      if (cancelAll) return { ok: false, finalUrl: initialUrl, error: "cancelled", method: "none" };
-      await tabSem.acquire();
-      let applyUrl = null, applyKind = "";
-      try {
-        if (cancelAll) return { ok: false, finalUrl: initialUrl, error: "cancelled", method: "none" };
-        const d = await resolveByDetailPage(initialUrl);
-        if (!d.ok) return { ...d, applyInitial: initialUrl, method: "detail-fail" };
-        applyUrl = d.finalUrl; applyKind = d.kind || "";
-      } finally { tabSem.release(); }
-      if (cancelAll) return { ok: false, finalUrl: applyUrl, error: "cancelled", method: "detail" };
-      const f = await fetchFollow(applyUrl);
-      if (f.ok && f.finalUrl && !isAggregator(f.finalUrl)) {
-        state.fetchHits += 1;
-        return { ok: true, finalUrl: f.finalUrl, applyInitial: applyUrl, method: "detail+fetch", kind: applyKind };
-      }
-      if (cancelAll) return { ok: false, finalUrl: f.finalUrl || applyUrl, error: "cancelled", method: "detail+fetch" };
-      await tabSem.acquire();
-      try {
-        if (cancelAll) return { ok: false, finalUrl: f.finalUrl || applyUrl, error: "cancelled", method: "detail+fetch" };
-        const t = await resolveByTab(f.finalUrl || applyUrl);
-        state.tabHits += 1;
-        return { ok: t.ok && !isAggregator(t.finalUrl), finalUrl: t.finalUrl, applyInitial: applyUrl, method: t.ok ? "detail+tab" : ("detail+tab:" + (t.error || "fail")), kind: applyKind };
-      } finally { tabSem.release(); }
+      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (fast.error || "apply_url not found"), method: "no-tab" };
     }
+
+    // simplify.jobs — follow the /jobs/click/{id} HTTP redirect with fetch.
     if (CLICK_REDIRECT_HOSTS.has(startHost)) {
-      // FAST PATH (no tab): with broad host access the service worker can follow
-      // the /jobs/click/{id} HTTP redirect with fetch and read the final ATS URL.
       const cf = await fetchFollow(initialUrl);
       if (cf.ok && cf.finalUrl && !CLICK_REDIRECT_HOSTS.has(hostOf(cf.finalUrl))) {
         state.fetchHits += 1;
         return { ok: true, finalUrl: cleanFinalUrl(cf.finalUrl), applyInitial: initialUrl, method: "click-fetch" };
       }
-      if (cancelAll) return { ok: false, finalUrl: initialUrl, error: "cancelled", method: "none" };
-      // FALLBACK: follow it in a tab (rare — only if the fetch can't read it).
-      await tabSem.acquire();
-      try {
-        if (cancelAll) return { ok: false, finalUrl: initialUrl, error: "cancelled", method: "none" };
-        const t = await resolveByTab(initialUrl);
-        state.tabHits += 1;
-        const left = t.finalUrl && !CLICK_REDIRECT_HOSTS.has(hostOf(t.finalUrl));
-        return { ok: t.ok && left, finalUrl: cleanFinalUrl(t.finalUrl), applyInitial: initialUrl, method: t.ok ? "click-tab" : ("click-tab:" + (t.error || "fail")) };
-      } finally { tabSem.release(); }
+      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "needs JS redirect"), method: "no-tab" };
     }
+
+    // Everything else — plain fetch with HTTP redirect following.
     const f = await fetchFollow(initialUrl);
     if (f.ok && f.finalUrl && !isAggregator(f.finalUrl)) {
       state.fetchHits += 1;
       return { ok: true, finalUrl: cleanFinalUrl(f.finalUrl), applyInitial: initialUrl, method: "fetch" };
     }
-    if (cancelAll) return { ok: false, finalUrl: f.finalUrl || initialUrl, error: "cancelled", method: "fetch" };
-    await tabSem.acquire();
-    try {
-      if (cancelAll) return { ok: false, finalUrl: f.finalUrl || initialUrl, error: "cancelled", method: "fetch" };
-      const t = await resolveByTab(f.finalUrl || initialUrl);
-      state.tabHits += 1;
-      return { ok: t.ok, finalUrl: cleanFinalUrl(t.finalUrl), applyInitial: initialUrl, method: t.ok ? "tab" : ("tab:" + (t.error || "fail")) };
-    } finally { tabSem.release(); }
+    return { ok: false, finalUrl: f.finalUrl || initialUrl, applyInitial: initialUrl, error: "no-tab: " + (f.error || "needs JS redirect"), method: "no-tab" };
   } finally {
-    state.inFlight -= 1; persistState();
+    state.inFlight = Math.max(0, state.inFlight - 1); persistState();
   }
 }
 
