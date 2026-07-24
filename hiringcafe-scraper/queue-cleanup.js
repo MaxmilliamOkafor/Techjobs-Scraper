@@ -108,8 +108,7 @@
       log("⚠ Filter mode is on but no filter text was entered. Try: lever, dandy"); return;
     }
 
-    const raw = parseInt(els.delayInput?.value, 10);
-    const delay = Math.max(0, Number.isFinite(raw) ? raw : 300);
+    const delay = 1; // fixed 1ms between deletes (no user toggle)
     const rawMax = parseInt(els.maxInput?.value, 10);
     const maxDeletes = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : Infinity;
 

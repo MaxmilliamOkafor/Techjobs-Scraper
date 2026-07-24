@@ -290,8 +290,7 @@
     els.fileInput.disabled = true;
     els.dropzone.classList.add("disabled");
 
-    const raw = parseInt(els.delayInput?.value, 10);
-    const delay = Math.max(0, Number.isFinite(raw) ? raw : 250);
+    const delay = 1; // fixed 1ms between adds (no user toggle)
     let added = 0;
     const failed = [];
     const startAt = nextIndex;
