@@ -32,8 +32,27 @@
   if (!els.card) return; // markup not present — nothing to wire up.
 
   let masterList = []; // deduped, supported URLs across all files
+  let nextIndex = 0;   // resume pointer: index of the first URL not yet processed
   let running = false;
   let stopRequested = false;
+
+  // Progress is persisted so a run RESUMES where it stopped instead of restarting
+  // from the top, and survives the side panel being torn down / reloaded mid-run
+  // (which is the usual cause of it "randomly stopping").
+  const LA_STATE_KEY = "lazyapply_queue_state";
+  function listSignature(list) {
+    return list.length + "|" + (list[0] || "") + "|" + (list[list.length - 1] || "");
+  }
+  function persistQueueState() {
+    try {
+      chrome.storage.local.set({
+        [LA_STATE_KEY]: { sig: listSignature(masterList), master: masterList, nextIndex }
+      });
+    } catch (_) {}
+  }
+  function clearQueueState() {
+    try { chrome.storage.local.remove(LA_STATE_KEY); } catch (_) {}
+  }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   function log(line) {
@@ -119,15 +138,33 @@
     setProgress(0);
     const { perFile, master } = await readFiles(fileList);
     masterList = master;
+    // If this is the SAME list a previous (interrupted) run was working through,
+    // resume from where it stopped rather than re-adding everything.
+    let resumed = 0;
+    try {
+      const stored = await chrome.storage.local.get(LA_STATE_KEY);
+      const s = stored[LA_STATE_KEY];
+      if (s && s.sig === listSignature(master) && Number.isFinite(s.nextIndex)) {
+        nextIndex = Math.min(Math.max(0, s.nextIndex), master.length);
+        resumed = nextIndex;
+      } else {
+        nextIndex = 0;
+      }
+    } catch (_) { nextIndex = 0; }
+    persistQueueState();
     const totalRaw = perFile.reduce((a, b) => a + b.count, 0);
     const lines = perFile.map((p) => `  • ${p.name}: ${p.count} supported`);
     els.summary.textContent =
       `${perFile.length} file(s) scanned\n${lines.join("\n")}` +
-      `\n\nSupported (pre-dedupe): ${totalRaw}\nUnique to add: ${master.length}`;
+      `\n\nSupported (pre-dedupe): ${totalRaw}\nUnique to add: ${master.length}` +
+      (resumed > 0 ? `\nAlready added: ${resumed} — will resume from #${resumed + 1}` : "");
     els.startBtn.disabled = master.length === 0;
+    setProgress(master.length ? nextIndex / master.length : 0);
     log(
       master.length
-        ? `Loaded ${master.length} unique supported URL(s). Open the LazyApply Job Queue, then click "Add to LazyApply Queue".`
+        ? (resumed > 0
+            ? `Loaded ${master.length} URL(s). ${resumed} already added — click "Add to LazyApply Queue" to resume from #${resumed + 1}.`
+            : `Loaded ${master.length} unique supported URL(s). Open the LazyApply Job Queue, then click "Add to LazyApply Queue".`)
         : "No supported ATS URLs found in those file(s)."
     );
   }
@@ -242,11 +279,9 @@
 
   async function runQueue() {
     if (running || !masterList.length) return;
-    const tab = await findLazyApplyTab();
-    if (!tab) {
-      log('⚠ Open https://app.lazyapply.com/dashboard and select the "Job Queue" tab first.');
-      return;
-    }
+
+    // A completed list re-run from scratch when the user clicks again.
+    if (nextIndex >= masterList.length) { nextIndex = 0; persistQueueState(); }
 
     running = true;
     stopRequested = false;
@@ -259,12 +294,22 @@
     const delay = Math.max(0, Number.isFinite(raw) ? raw : 250);
     let added = 0;
     const failed = [];
-    log(`\n▶ Adding ${masterList.length} URL(s) — ~${delay}ms apart.\n`);
+    const startAt = nextIndex;
+    log(`\n▶ Adding ${masterList.length - startAt} URL(s) (from #${startAt + 1}) — ~${delay}ms apart.\n`);
 
-    for (let i = 0; i < masterList.length; i++) {
-      if (stopRequested) { log(`\n■ Stopped at ${i}/${masterList.length}.`); break; }
+    let i = startAt;
+    for (; i < masterList.length; i++) {
+      if (stopRequested) { nextIndex = i; persistQueueState(); log(`\n■ Stopped at ${i}/${masterList.length}. Click "Add to LazyApply Queue" to resume from #${i + 1}.`); break; }
       const url = masterList[i];
       setProgress(i / masterList.length);
+      // Re-find the tab every iteration so a closed/re-opened LazyApply tab (a
+      // common cause of the run halting) is picked up instead of killing the run.
+      const tab = await findLazyApplyTab();
+      if (!tab) {
+        nextIndex = i; persistQueueState();
+        log(`\n■ LazyApply tab not found — paused at ${i}/${masterList.length}. Open https://app.lazyapply.com/dashboard (Job Queue) and click "Add to LazyApply Queue" to resume from #${i + 1}.`);
+        break;
+      }
       try {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
@@ -283,17 +328,27 @@
         failed.push({ url, error: e?.message || String(e) });
         log(`Adding ${i + 1}/${masterList.length} ✗  ${url}  — ${e?.message || e}`);
       }
+      // Advance the resume pointer AFTER each URL is processed and persist it, so
+      // a mid-run teardown resumes here instead of restarting from the top.
+      nextIndex = i + 1;
+      persistQueueState();
       await sleep(delay);
     }
 
-    setProgress(1);
     running = false;
     els.stopBtn.disabled = true;
     els.fileInput.disabled = false;
     els.dropzone.classList.remove("disabled");
     els.startBtn.disabled = masterList.length === 0;
 
-    log(`\n✔ Done. Added: ${added}.  Failed/skipped: ${failed.length}.`);
+    if (nextIndex >= masterList.length) {
+      // Whole list finished — clear saved progress so the next upload starts clean.
+      setProgress(1);
+      clearQueueState();
+      log(`\n✔ Done. Added this run: ${added}.  Failed/skipped: ${failed.length}.`);
+    } else {
+      setProgress(nextIndex / masterList.length);
+    }
     if (failed.length) {
       log("Failed URLs:");
       failed.forEach((f) => log(`  • ${f.url}  (${f.error})`));
@@ -329,4 +384,24 @@
 
   els.startBtn.addEventListener("click", runQueue);
   els.stopBtn.addEventListener("click", () => { stopRequested = true; els.stopBtn.disabled = true; });
+
+  // Restore an interrupted run when the side panel reloads, so the list and the
+  // resume point survive a teardown and the user can continue with one click.
+  (async function restoreQueueState() {
+    try {
+      const stored = await chrome.storage.local.get(LA_STATE_KEY);
+      const s = stored[LA_STATE_KEY];
+      if (s && Array.isArray(s.master) && s.master.length && s.sig === listSignature(s.master)) {
+        masterList = s.master;
+        nextIndex = Math.min(Math.max(0, s.nextIndex || 0), masterList.length);
+        if (nextIndex >= masterList.length) { clearQueueState(); return; }
+        els.startBtn.disabled = false;
+        setProgress(nextIndex / masterList.length);
+        els.summary.textContent =
+          `Restored a previous run.\nTotal: ${masterList.length}\nAlready added: ${nextIndex}` +
+          `\nClick "Add to LazyApply Queue" to resume from #${nextIndex + 1}.`;
+        log(`Restored interrupted run — ${nextIndex}/${masterList.length} already added. Click "Add to LazyApply Queue" to resume from #${nextIndex + 1}.`);
+      }
+    } catch (_) {}
+  })();
 })();
