@@ -26,7 +26,7 @@
   // Aggregator hosts that must NEVER survive into the exported "Job URL" column —
   // a real ATS link (greenhouse/lever/workday/etc.) is the only acceptable value.
   // If resolution returns one of these (or fails), the URL is treated as unresolved.
-  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
   function isResolvedExternalUrl(u) {
     if (!u || !/^https?:\/\//i.test(u)) return false;
     try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
@@ -1062,14 +1062,19 @@ const CH_SALARY_RE = /[\u20ac\u00a3$]\s?\d/;
 const CH_AGE_RE = /^\d+\s*[smhdw]$/i;
 function chGetCards() {
   return Array.from(document.querySelectorAll('div.\\[content-visibility\\:auto\\]'))
-    .filter((c) => c.querySelector('a[target="_blank"]'))
+    // Accept any card carrying a link — not only target="_blank" — so a card
+    // whose Apply control renders differently is still picked up.
+    .filter((c) => c.querySelector('a[href]'))
     .filter(isVisible);
 }
 function chCardTitle(card) {
   const h = card.querySelector("h1,h2,h3,h4,h5,h6");
   if (h) return visibleText(h);
-  const links = Array.from(card.querySelectorAll('a[target="_blank"]'));
-  const nonApply = links.find((a) => !/^apply$/i.test(visibleText(a)));
+  const links = Array.from(card.querySelectorAll('a[href]'));
+  const nonApply = links.find((a) => {
+    const t = visibleText(a);
+    return t && !/^apply\b/i.test(t) && !/more from this company/i.test(t);
+  });
   return nonApply ? visibleText(nonApply) : "";
 }
 function chCardCompany(card, title) {
@@ -1099,10 +1104,36 @@ function chCardDescription(card) {
   }
   return best;
 }
+// The job URL lives on the card's "Apply" control. Resolve it defensively:
+// never return an internal careerhound.io link (e.g. "More from this company"),
+// because the exported Job URL column must only ever hold the external ATS URL.
+function chApplyUrl(card) {
+  const isExternal = (a) => {
+    if (!a || !a.href || !/^https?:/i.test(a.href)) return false;
+    try { return !/(^|\.)careerhound\.io$/i.test(new URL(a.href).host); }
+    catch (_) { return false; }
+  };
+  const anchors = Array.from(card.querySelectorAll("a"));
+  // 1) The anchor labelled "Apply" (tolerates "Apply now", trailing icon text).
+  const apply = anchors.find((a) => /^apply\b/i.test(visibleText(a)) && isExternal(a));
+  if (apply) return apply.href;
+  // 2) Any other external anchor, skipping the internal "More from this company".
+  const ext = anchors.find((a) => isExternal(a) && !/more from this company/i.test(visibleText(a)));
+  if (ext) return ext.href;
+  // 3) Apply rendered as a <button> — check common data-* attributes.
+  for (const b of card.querySelectorAll("button, [role='button']")) {
+    if (!/^apply\b/i.test(visibleText(b))) continue;
+    for (const k of ["data-url", "data-href", "data-apply-url", "data-link"]) {
+      const v = b.getAttribute(k);
+      if (v && /^https?:/i.test(v)) {
+        try { if (!/(^|\.)careerhound\.io$/i.test(new URL(v).host)) return v; } catch (_) {}
+      }
+    }
+  }
+  return "";
+}
 function chBuildRow(card) {
-  const links = Array.from(card.querySelectorAll('a[target="_blank"]'));
-  const applyLink = links.find((a) => /^apply$/i.test(visibleText(a))) || links[0];
-  const url = applyLink ? applyLink.href : "";
+  const url = chApplyUrl(card);
   const title = chCardTitle(card);
   const chips = Array.from(card.querySelectorAll("span, div, button")).map(visibleText).filter(Boolean);
   let work_mode = "", commitment = "", salary = "", posted_age = "";
