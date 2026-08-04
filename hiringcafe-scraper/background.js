@@ -9,11 +9,12 @@ const RESULTS_KEY = "hiringcafe_results";
 // Sites this extension can scrape. Add new sites here to extend support.
 const SITE_MATCHES = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -172,7 +173,11 @@ async function fetchFollow(url) {
 // first so a single set of patterns covers both shapes, and we try several known
 // key names. Self-referential hiring.cafe values are rejected so they never leak
 // into the exported "url" column.
-const HIRINGCAFE_APPLY_KEYS = ["apply_url", "applyUrl", "externalApplyUrl", "apply_link", "applyLink", "external_apply_url"];
+const HIRINGCAFE_APPLY_KEYS = ["apply_url", "applyUrl", "externalApplyUrl", "apply_link", "applyLink", "external_apply_url", "applicationUrl", "application_url", "job_url", "jobUrl"];
+// Known ATS / job-application providers. Used as a last-resort fallback: if no
+// apply_url key matches (e.g. hiring.cafe renamed the field), the first link in
+// the page pointing at one of these is almost certainly the real apply target.
+const ATS_HOST_RE = /(^|\.)(greenhouse\.io|lever\.co|ashbyhq\.com|myworkdayjobs\.com|myworkdaysite\.com|workable\.com|bamboohr\.com|icims\.com|taleo\.net|successfactors\.com|smartrecruiters\.com|jobvite\.com|breezy\.hr|recruitee\.com|teamtailor\.com|rippling\.com|eightfold\.ai|paylocity\.com|dayforcehcm\.com|oraclecloud\.com|ultipro\.com)$|(^|\.)(personio\.(?:com|de))$|workforcenow\.adp\.com$/i;
 function extractApplyUrlFromHtml(html) {
   if (!html) return null;
   // Collapse JSON-string and unicode escaping so both embedding shapes look alike.
@@ -190,6 +195,12 @@ function extractApplyUrlFromHtml(html) {
       // Never return an internal hiring.cafe link — let resolution fall through.
       if (!SITE_HOST_RE.test(hostOf(v))) return v;
     }
+  }
+  // Fallback: first link anywhere in the page that targets a known ATS host.
+  const urls = normalized.match(/https?:\/\/[^"'\s<>\\)]+/gi) || [];
+  for (const u of urls) {
+    const h = hostOf(u);
+    if (h && !SITE_HOST_RE.test(h) && ATS_HOST_RE.test(h)) return u;
   }
   return null;
 }
@@ -571,6 +582,7 @@ async function findTargetTab(preferTabId) {
 function siteLabelFor(url) {
   const h = hostOf(url);
   if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/careerhound\.io$/i.test(h)) return "careerhound.io";
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
   if (/simplify\.jobs$/i.test(h)) return "simplify.jobs";
   if (/hnhiring\.com$/i.test(h)) return "hnhiring.com";
@@ -594,7 +606,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_SCRAPE": {
           const target = await findTargetTab();
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
@@ -660,7 +672,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_PICKER": {
           const target = await findTargetTab(msg.tabId);
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
           try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {

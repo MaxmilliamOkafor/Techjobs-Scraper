@@ -1,4 +1,7 @@
 // content.js — hiring.cafe + eurotoptech.com + simplify.jobs
+// v2.3.0 — the exported "Job URL" column now only ever holds a resolved external
+//          ATS link; aggregator links (hiring.cafe/job/...) are never stored —
+//          unresolved rows are left blank and flagged in the status column.
 // v2.1.0 — fixed card boundary, title/company extraction, "X or Y" locations,
 //          multi-currency (€/£/$) salary; single clean copy (duplicate removed).
 
@@ -20,6 +23,14 @@
   let pickerMode = "pagination"; // or "column"
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Aggregator hosts that must NEVER survive into the exported "Job URL" column —
+  // a real ATS link (greenhouse/lever/workday/etc.) is the only acceptable value.
+  // If resolution returns one of these (or fails), the URL is treated as unresolved.
+  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+  function isResolvedExternalUrl(u) {
+    if (!u || !/^https?:\/\//i.test(u)) return false;
+    try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
+  }
   function send(type, payload = {}) {
     return new Promise((resolve) => {
       try {
@@ -104,6 +115,14 @@
       if (/^View all\b/i.test(visibleText(a))) return a;
     }
     return null;
+  }
+  // Stable identity for a job card, used to dedupe across pages so a relevance
+  // reshuffle (same jobs, new order) can't make pagination loop forever.
+  function cardKey(card) {
+    const a = getJobPostingAnchor(card);
+    if (a && a.href) return a.href;
+    const t = (getTitle(card) + "|" + getCompanyName(card)).trim();
+    return t === "|" ? "" : t;
   }
   // Title = largest non-company, non-action, non-meta text leaf.
   // hiring.cafe cards have no h1-h6, so the font-size heuristic carries the
@@ -510,14 +529,15 @@
       if (row.job_posting_initial_url) {
         const r = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
         if (r) {
-          if (r.ok) {
-            row.url = r.finalUrl || row.job_posting_initial_url;
+          row.method = r.method || "";
+          if (r.ok && isResolvedExternalUrl(r.finalUrl)) {
+            row.url = r.finalUrl;
             row.status = "ok";
-            row.method = r.method || "";
           } else {
-            row.url = r.finalUrl || row.job_posting_initial_url;
-            row.status = "error: " + (r.error || "unknown");
-            row.method = r.method || "";
+            // Resolution failed (or returned an aggregator link) — never fall back
+            // to the hiring.cafe URL. Leave url blank and flag it for review.
+            row.url = "";
+            row.status = "unresolved: " + (r.error || "no external url");
           }
         } else { row.status = "no response"; }
       }
@@ -531,25 +551,51 @@
     }));
   }
 
+  // Hard safety cap so a misbehaving "next" control can never scrape forever.
+  const MAX_PAGINATION_PAGES = 100;
   async function runPagination(options) {
-    let pageIndex = 0;
-    while (!aborted) {
-      pageIndex += 1;
-      const paginationEl = findPagination();
-      const totalPages = getTotalPages(paginationEl);
-      const currentPage = getCurrentPageNumber(paginationEl) ?? pageIndex;
-      const cardsBefore = findJobCards();
-      const sigBefore = cardSignature(cardsBefore);
-      await scrapeCards(cardsBefore, currentPage, totalPages);
+    const seen = new Set();          // job keys captured this run (cross-page dedup)
+    let page = 0;                    // how many pages we've visited (1-based once inside)
+    let totalPages = getTotalPages(findPagination()); // e.g. 3 — reliable (max numbered btn)
+    let emptyStreak = 0;             // consecutive pages that produced no new jobs
+    while (!aborted && page < MAX_PAGINATION_PAGES) {
+      page += 1;
+      // Make sure cards for this page have actually rendered before scraping.
+      await waitForCardsToExist();
+      const allCards = findJobCards();
+      const sigBefore = cardSignature(allCards);
+      // Only scrape jobs we haven't already captured — a relevance reshuffle of
+      // the same jobs (hiring.cafe does this) must not be re-scraped or recounted.
+      const newCards = allCards.filter((c) => {
+        const k = cardKey(c);
+        if (!k) return true;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      if (newCards.length) { emptyStreak = 0; await scrapeCards(newCards, page, totalPages); }
+      else emptyStreak += 1;
       if (aborted) break;
+      // Keep totalPages current — the control may reveal more pages as we go.
+      const tpNow = getTotalPages(findPagination());
+      if (tpNow) totalPages = Math.max(totalPages || 0, tpNow);
+      // PRIMARY stop: we've visited every numbered page. Driven by our own page
+      // counter (one click per loop), NOT the flaky "current page" heuristic that
+      // was stopping a page early.
+      if (totalPages && page >= totalPages) return;
+      // SAFETY stop: several pages in a row yielded nothing new (true end of list,
+      // or a control that only reshuffles). Higher threshold so a single
+      // overlap-heavy page can't end the run prematurely.
+      if (emptyStreak >= 3) return;
       let nextEl = null;
       if (options.paginationSpec) nextEl = findByElementSpec(options.paginationSpec);
-      if (!nextEl) nextEl = autoDetectNextButton(paginationEl);
-      if (!nextEl) return;
+      if (!nextEl) nextEl = autoDetectNextButton(findPagination());
+      if (!nextEl) return;            // no next control -> last page reached
       clickAt(nextEl);
       await sleep(POST_CLICK_GRACE_MS);
-      const changed = await waitForCardsToChange(sigBefore);
-      if (!changed) return;
+      // Wait for the page to turn over. Even if this times out (slow page 3), we
+      // do NOT bail — the next loop re-reads cards and dedup handles any overlap.
+      await waitForCardsToChange(sigBefore);
     }
   }
 
@@ -968,9 +1014,14 @@ async function sjRun() {
       if (row.job_posting_initial_url) {
         const resp = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
         if (resp) {
-          row.url = resp.finalUrl || row.job_posting_initial_url;
-          row.status = resp.ok ? "ok" : ("error: " + (resp.error || "unknown"));
           row.method = resp.method || "";
+          if (resp.ok && isResolvedExternalUrl(resp.finalUrl)) {
+            row.url = resp.finalUrl;
+            row.status = "ok";
+          } else {
+            row.url = "";
+            row.status = "unresolved: " + (resp.error || "no external url");
+          }
         } else row.status = "no response";
       }
       await send("JOB_SCRAPED", { row });

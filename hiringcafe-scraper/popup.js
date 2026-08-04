@@ -1,15 +1,16 @@
-// popup.js — UI for Tech Jobs Scraper (hiring.cafe + eurotoptech, two-picker, single-line CSV)
+// popup.js — UI for Tech Jobs Scraper (hiring.cafe + careerhound.io + eurotoptech, two-picker, single-line CSV)
 
 const SETTINGS_KEY = "hiringcafe_settings";
 
 // Both supported sites — used for tab discovery and validation.
 const SITE_MATCH = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*"
 ];
-const ON_SITE_RE = /(hiring\.cafe|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
+const ON_SITE_RE = /(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
 
 const els = {
   startBtn: document.getElementById("start-btn"),
@@ -177,7 +178,7 @@ async function startPickerMode(mode) {
   els.errorRow.hidden = true;
   const tabs = await chrome.tabs.query({ url: SITE_MATCH });
   if (!tabs.length) {
-    els.errorRow.textContent = "Open hiring.cafe, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
+    els.errorRow.textContent = "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
     els.errorRow.hidden = false;
     return;
   }
@@ -219,7 +220,7 @@ els.startBtn.addEventListener("click", async () => {
   if (!onSite) {
     const tabs = await chrome.tabs.query({ url: SITE_MATCH });
     if (!tabs.length) {
-      els.errorRow.textContent = "Open hiring.cafe, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
+      els.errorRow.textContent = "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
       els.errorRow.hidden = false;
       els.startBtn.disabled = false;
       return;

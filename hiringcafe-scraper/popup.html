@@ -11,7 +11,7 @@
     <div class="logo" aria-hidden="true">TJ</div>
     <div>
       <h1>Tech Jobs Scraper</h1>
-      <p class="sub">hiring.cafe, eurotoptech, simplify &amp; hnhiring.com — job &amp; URL scraper</p>
+      <p class="sub">hiring.cafe, careerhound.io, eurotoptech, simplify &amp; hnhiring.com — job &amp; URL scraper</p>
     </div>
   </header>
 
@@ -101,10 +101,6 @@
     </div>
     <input type="file" id="csv-file-input" accept=".csv,.txt" multiple hidden />
     <pre id="csv-summary" class="csv-summary" aria-live="polite"></pre>
-    <div class="csv-delay-row">
-      <label for="csv-delay">Extra delay between adds (ms)</label>
-      <input type="number" id="csv-delay" value="250" min="0" step="50" />
-    </div>
     <div class="actions csv-actions">
       <button id="csv-start-btn" class="primary" disabled>Add to LazyApply Queue</button>
       <button id="csv-stop-btn" class="ghost" disabled>Stop</button>
@@ -134,10 +130,6 @@
     </div>
     <input type="text" id="cleanup-filter" class="cleanup-input" placeholder="e.g. lever, dandy, greenhouse" disabled />
     <div class="csv-delay-row">
-      <label for="cleanup-delay">Delay between deletes (ms)</label>
-      <input type="number" id="cleanup-delay" value="300" min="0" step="50" />
-    </div>
-    <div class="csv-delay-row">
       <label for="cleanup-max">Max to delete (blank = no limit)</label>
       <input type="number" id="cleanup-max" placeholder="∞" min="1" step="1" />
     </div>
@@ -156,6 +148,7 @@
     <p class="hint">
       Open
       <a id="open-hc" href="https://hiring.cafe/" target="_blank" rel="noopener">hiring.cafe</a>
+      <a href="https://careerhound.io/" target="_blank" rel="noopener">careerhound.io</a>,
       <a href="https://eurotoptech.com/" target="_blank" rel="noopener">eurotoptech</a>,
       <a href="https://simplify.jobs/" target="_blank" rel="noopener">simplify</a>,
       or <a href="https://hnhiring.com/" target="_blank" rel="noopener">hnhiring.com</a>,
