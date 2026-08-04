@@ -993,7 +993,164 @@ async function sjRun() {
 }
 // =================== end simplify.jobs adapter ===================
 
+//                       careerhound.io adapter                       
+// careerhound.io renders job listings as a responsive grid of cards. Each card
+// is a <div class="[content-visibility:auto] ..."> that contains an <a target=
+// "_blank"> whose href is ALREADY the final external employer / ATS URL (Oracle
+// Cloud, Comeet, BambooHR, Taleo, Greenhouse, gov.uk, ...) — no redirect needs
+// resolving. All fields (title, company, work mode, commitment, salary,
+// posted age, description) are visible directly on the card, so we read them in
+// place without opening any detail view. Pagination is a classic Prev/Next pager
+// with a button[aria-label="Next page"]; cards fully replace on each page.
+function chIsTarget() {
+  return /(^|\.)careerhound\.io$/i.test(location.hostname);
+}
+const CH_MODE_VALUES = new Set(["on-site", "onsite", "remote", "hybrid", "in-person", "in person", "field"]);
+const CH_COMMIT_VALUES = new Set(["full time", "part time", "contract", "internship", "temporary", "full-time", "part-time"]);
+const CH_SALARY_RE = /[\u20ac\u00a3$]\s?\d/;
+const CH_AGE_RE = /^\d+\s*[smhdw]$/i;
+function chGetCards() {
+  return Array.from(document.querySelectorAll('div.\\[content-visibility\\:auto\\]'))
+    .filter((c) => c.querySelector('a[target="_blank"]'))
+    .filter(isVisible);
+}
+function chCardTitle(card) {
+  const h = card.querySelector("h1,h2,h3,h4,h5,h6");
+  if (h) return visibleText(h);
+  const links = Array.from(card.querySelectorAll('a[target="_blank"]'));
+  const nonApply = links.find((a) => !/^apply$/i.test(visibleText(a)));
+  return nonApply ? visibleText(nonApply) : "";
+}
+function chCardCompany(card, title) {
+  const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
+  const texts = [];
+  let n;
+  while ((n = walker.nextNode())) {
+    const v = (n.textContent || "").replace(/\s+/g, " ").trim();
+    if (v) texts.push(v);
+  }
+  let ti = texts.findIndex((t) => t === title || (title && title.startsWith(t)));
+  if (ti < 0) ti = 0;
+  for (let i = ti + 1; i < texts.length; i++) {
+    const t = texts[i], lc = t.toLowerCase();
+    if (CH_MODE_VALUES.has(lc) || CH_COMMIT_VALUES.has(lc) || CH_SALARY_RE.test(t) ||
+        CH_AGE_RE.test(t) || /^apply$/i.test(t) || /more from this company/i.test(t)) continue;
+    return t;
+  }
+  return "";
+}
+function chCardDescription(card) {
+  const leaves = Array.from(card.querySelectorAll("p, div, span")).filter((e) => e.children.length <= 1);
+  let best = "";
+  for (const el of leaves) {
+    const t = visibleText(el);
+    if (t.length > best.length && !/more from this company/i.test(t)) best = t;
+  }
+  return best;
+}
+function chBuildRow(card) {
+  const links = Array.from(card.querySelectorAll('a[target="_blank"]'));
+  const applyLink = links.find((a) => /^apply$/i.test(visibleText(a))) || links[0];
+  const url = applyLink ? applyLink.href : "";
+  const title = chCardTitle(card);
+  const chips = Array.from(card.querySelectorAll("span, div, button")).map(visibleText).filter(Boolean);
+  let work_mode = "", commitment = "", salary = "", posted_age = "";
+  for (const c of chips) {
+    const lc = c.toLowerCase();
+    if (!work_mode && CH_MODE_VALUES.has(lc)) work_mode = c;
+    else if (!commitment && CH_COMMIT_VALUES.has(lc)) commitment = c;
+    else if (!salary && CH_SALARY_RE.test(c) && c.length < 40) salary = c;
+    else if (!posted_age && CH_AGE_RE.test(c)) posted_age = c;
+  }
+  return {
+    url: url,
+    title: title,
+    company: chCardCompany(card, title),
+    location: "",
+    salary: salary,
+    work_mode: work_mode,
+    commitment: commitment,
+    yoe: "",
+    posted_age: posted_age,
+    description: chCardDescription(card),
+    skills: "",
+    job_posting_initial_url: url,
+    hiringcafe_viewall_url: location.href,
+    status: url ? "ok" : "no apply url found",
+    method: "apply-href",
+    scraped_at: new Date().toISOString()
+  };
+}
+function chGetPagination() {
+  return {
+    next: document.querySelector('button[aria-label="Next page"], a[aria-label="Next page"]'),
+    current: (() => {
+      const nodes = Array.from(document.querySelectorAll("*"));
+      const p = nodes.find((e) => /^Page\s+\d+$/.test(visibleText(e)) && e.children.length === 0);
+      const m = p ? visibleText(p).match(/(\d+)/) : null;
+      return m ? parseInt(m[1], 10) : null;
+    })(),
+    total: null
+  };
+}
+async function chWaitForCardChange(prevFirstTitle) {
+  const start = Date.now();
+  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS) {
+    if (aborted) return false;
+    await sleep(150);
+    const cards = chGetCards();
+    const first = cards[0];
+    const t = first ? chCardTitle(first) : "";
+    if (t && t !== prevFirstTitle) return true;
+  }
+  return false;
+}
+async function chScrapePage(pageIndex, totalPages) {
+  const cards = chGetCards();
+  await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: 0, status: "running" });
+  let completed = 0;
+  for (let i = 0; i < cards.length; i++) {
+    if (aborted) return;
+    const card = cards[i];
+    try { card.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
+    const row = chBuildRow(card);
+    await send("JOB_SCRAPED", { row });
+    completed += 1;
+    if (completed % 4 === 0 || completed === cards.length)
+      await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: completed, status: "running" });
+  }
+}
+async function chRun(options) {
+  options = options || {};
+  aborted = false;
+  if (!chGetCards().length) {
+    const start = Date.now();
+    while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !chGetCards().length) await sleep(150);
+  }
+  if (!chGetCards().length) { await send("SCRAPE_DONE", { error: "No job cards found on careerhound.io page." }); return; }
+  let guard = 0;
+  while (!aborted) {
+    guard += 1;
+    const pag = chGetPagination();
+    const pageIndex = pag.current || guard;
+    const cards = chGetCards();
+    const prevFirstTitle = cards[0] ? chCardTitle(cards[0]) : "";
+    await chScrapePage(pageIndex, pag.total);
+    if (aborted) break;
+    let next = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
+    if (!next) next = chGetPagination().next;
+    if (!next || next.disabled || next.getAttribute("aria-disabled") === "true") break;
+    clickAt(next);
+    await sleep(POST_CLICK_GRACE_MS);
+    const changed = await chWaitForCardChange(prevFirstTitle);
+    if (!changed) break;
+  }
+  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+}
+//                     end careerhound.io adapter                     
+
 async function runScrape(options) {
+  if (chIsTarget()) { return chRun(options); }
   if (sjIsTarget()) { return sjRun(options); }
   if (ettIsTarget()) { return ettRun(options); }
     aborted = false;
