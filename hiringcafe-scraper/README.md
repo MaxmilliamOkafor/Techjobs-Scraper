@@ -4,6 +4,16 @@ A Chrome extension (Manifest V3) that scrapes job listings from [hiring.cafe](ht
 
 The point of this project: hiring.cafe's "Job Posting" link often doesn't expose the final destination URL until after redirects fire. This extension resolves redirects transparently — using a fast HTTP fetch path when possible and falling back to a hidden background tab only when JavaScript-side redirects require a real browser context. The CSV you download contains real, clickable employer URLs, not aggregator redirects.
 
+## Supported sites
+
+Although this started as a hiring.cafe scraper, the extension now recognises several job boards and picks the right adapter automatically based on the current tab's hostname:
+
+- **hiring.cafe** — generic card scraper with Pagination / Load More / Auto-scroll strategies and full redirect resolution.
+- **careerhound.io** — dedicated adapter. Career Hound renders results as a card grid where each card's **Apply** link already points at the final external employer / ATS URL (Oracle Cloud, Comeet, BambooHR, Taleo, Greenhouse, gov.uk, ...), so no redirect resolution is needed. All fields are read directly off the card and it walks the standard Previous / Next pager (cards fully replace on each page). Just open your filtered search on `careerhound.io/search?...`, click **Start scraping**, and export the CSV.
+- **eurotoptech.com** — dialog-based adapter (opens each card to read its detail panel).
+- **simplify.jobs** — reads job data from the page's React state and follows the apply redirect in a background tab.
+- **hnhiring.com** — Hacker News "Who is hiring" ATS-link extractor.
+
 ## Features
 
 - **Lightning-fast resolution** — parallel `fetch()` with redirect-following, plus a bounded pool of hidden tabs as fallback. ~10× faster than naive per-tab resolution.
