@@ -9,11 +9,12 @@ const RESULTS_KEY = "hiringcafe_results";
 // Sites this extension can scrape. Add new sites here to extend support.
 const SITE_MATCHES = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -581,6 +582,7 @@ async function findTargetTab(preferTabId) {
 function siteLabelFor(url) {
   const h = hostOf(url);
   if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/careerhound\.io$/i.test(h)) return "careerhound.io";
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
   if (/simplify\.jobs$/i.test(h)) return "simplify.jobs";
   if (/hnhiring\.com$/i.test(h)) return "hnhiring.com";
@@ -604,7 +606,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_SCRAPE": {
           const target = await findTargetTab();
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
@@ -670,7 +672,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_PICKER": {
           const target = await findTargetTab(msg.tabId);
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
           try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {
