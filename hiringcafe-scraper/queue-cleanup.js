@@ -70,7 +70,9 @@
       if (showMore) {
         const before = renderedRows().length;
         showMore.click();
-        for (let i = 0; i < 20; i++) { await sleep(150); if (renderedRows().length > before) break; }
+        // Poll fast for the newly rendered rows instead of fixed 150ms ticks.
+        const smDeadline = Date.now() + 3000;
+        while (Date.now() < smDeadline) { if (renderedRows().length > before) break; await sleep(5); }
         for (const btn of removeButtons()) {
           const tr = btn.closest("tr");
           if (tr && matches(tr)) { target = { btn, tr }; break; }
@@ -85,10 +87,14 @@
     const before = renderedRows().length;
     target.btn.click();
 
+    // Poll at 5ms so each delete returns the moment the row disappears rather
+    // than waiting out a 100ms tick; same ~2.5s worst case as before.
     let confirmed = false;
-    for (let i = 0; i < 25; i++) {
-      await sleep(100);
+    const delDeadline = Date.now() + 2500;
+    for (;;) {
       if (!document.body.contains(target.btn) || renderedRows().length < before) { confirmed = true; break; }
+      if (Date.now() >= delDeadline) break;
+      await sleep(5);
     }
     return { ok: true, done: false, removed: label, confirmed, remaining: renderedRows().length };
   }

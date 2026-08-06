@@ -239,14 +239,19 @@
     setVal(url); // then set the URL
     fire("change");
 
-    // Wait for React to re-render and enable the button. A button that stays
-    // disabled means the input event didn't register yet → re-fire and retry.
+    // Wait for React to re-render and enable the button. Poll FAST (5ms) and
+    // break the instant it's ready, instead of sleeping a fixed 150ms per try —
+    // React usually enables it within a frame or two, so this is the single
+    // biggest speed win per URL. Same 600ms worst case as before.
     let btn = null;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      await sleep(150);
+    const btnDeadline = Date.now() + 600;
+    let ticks = 0;
+    for (;;) {
       btn = findAddButton(input);
       if (btn && !btn.disabled) break;
-      fire("input"); // nudge React again
+      if (Date.now() >= btnDeadline) break;
+      await sleep(5);
+      if (++ticks % 20 === 0) fire("input"); // nudge React periodically
     }
 
     if (!btn) {
@@ -260,12 +265,15 @@
     btn.click();
 
     // Confirmation: on a successful add MUI clears the field and the button
-    // returns to disabled. Poll for that (up to ~2.5s) as the success signal.
+    // returns to disabled. Poll at 5ms so we return the moment it lands rather
+    // than waiting out a 100ms tick; same ~2.5s worst case as before.
     let confirmed = false;
-    for (let i = 0; i < 25; i++) {
-      await sleep(100);
+    const confDeadline = Date.now() + 2500;
+    for (;;) {
       const cur = findInput();
       if ((cur && cur.value === "") || btn.disabled) { confirmed = true; break; }
+      if (Date.now() >= confDeadline) break;
+      await sleep(5);
     }
     return { ok: true, via: "click", confirmed };
   }
