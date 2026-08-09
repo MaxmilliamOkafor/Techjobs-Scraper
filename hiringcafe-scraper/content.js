@@ -1231,7 +1231,186 @@ async function chRun(options) {
 }
 //                     end careerhound.io adapter                     
 
+// ===================== jobright.ai adapter =====================
+// jobright.ai/jobs/recommend is a React SPA: an infinite-scrolling list of job
+// cards, each exposing "APPLY WITH AUTOFILL" and/or "APPLY NOW". The employer
+// ATS URL sits on those controls, so we anchor on the CONTROL rather than any
+// CSS class (class names here are hashed and change between builds). Two shapes
+// are handled: the control is an <a href> (read directly), or it is a <button>
+// carrying the URL in a data-* attribute. Internal jobright.ai links are never
+// returned, so the exported Job URL column only ever holds an external link.
+function jrIsTarget() {
+  return /(^|\.)jobright\.ai$/i.test(location.hostname);
+}
+const JR_APPLY_RE = /\b(apply\s+with\s+autofill|apply\s+now|autofill|apply)\b/i;
+const JR_SKIP_RE = /(save|hide|not interested|report|more from|similar|feedback|upgrade|sign in|log in)/i;
+function jrIsExternalUrl(u) {
+  if (!u || !/^https?:\/\//i.test(u)) return false;
+  try { return !/(^|\.)jobright\.ai$/i.test(new URL(u, location.href).host); }
+  catch (_) { return false; }
+}
+// Pull an apply URL out of a scope (a card, or the detail pane).
+function jrApplyUrl(scope) {
+  if (!scope) return "";
+  const controls = Array.from(scope.querySelectorAll('a, button, [role="button"]'));
+  const applyish = controls.filter((el) => {
+    const t = visibleText(el);
+    return t && JR_APPLY_RE.test(t) && !JR_SKIP_RE.test(t);
+  });
+  // 1) Apply control that is itself a link.
+  for (const el of applyish) {
+    if (el.tagName === "A" && jrIsExternalUrl(el.href)) return el.href;
+  }
+  // 2) Apply control carrying the URL in a data-* attribute.
+  for (const el of applyish) {
+    for (const k of ["data-url", "data-href", "data-apply-url", "data-link", "data-external-url", "href"]) {
+      const v = el.getAttribute && el.getAttribute(k);
+      if (v && jrIsExternalUrl(v)) return v;
+    }
+  }
+  // 3) An apply control wrapping (or wrapped by) an external anchor.
+  for (const el of applyish) {
+    const inner = el.querySelector && el.querySelector("a[href]");
+    if (inner && jrIsExternalUrl(inner.href)) return inner.href;
+    const outer = el.closest && el.closest("a[href]");
+    if (outer && jrIsExternalUrl(outer.href)) return outer.href;
+  }
+  // 4) Last resort: any external anchor inside the scope.
+  const ext = Array.from(scope.querySelectorAll("a[href]"))
+    .find((a) => jrIsExternalUrl(a.href) && !JR_SKIP_RE.test(visibleText(a)));
+  return ext ? ext.href : "";
+}
+// Cards are derived by climbing from each apply control to the smallest
+// ancestor that looks like a whole listing (enough text, not the entire page).
+function jrGetCards() {
+  const controls = Array.from(document.querySelectorAll('a, button, [role="button"]'))
+    .filter((el) => {
+      const t = visibleText(el);
+      return t && JR_APPLY_RE.test(t) && !JR_SKIP_RE.test(t) && isVisible(el);
+    });
+  const cards = [];
+  const seen = new Set();
+  for (const ctl of controls) {
+    let node = ctl.parentElement, card = null, safety = 0;
+    while (node && node !== document.body && safety < 25) {
+      const txt = visibleText(node);
+      if (txt.length > 60 && node.querySelectorAll("a, button").length < 40) { card = node; break; }
+      node = node.parentElement; safety += 1;
+    }
+    if (card && !seen.has(card)) { seen.add(card); cards.push(card); }
+  }
+  return cards;
+}
+function jrCardTitle(card) {
+  const h = card.querySelector("h1,h2,h3,h4,h5,h6");
+  if (h && visibleText(h)) return visibleText(h);
+  let best = "", bestScore = 0;
+  for (const el of card.querySelectorAll("*")) {
+    if (el.children.length) continue;
+    const t = visibleText(el);
+    if (!t || t.length < 3 || t.length > 200) continue;
+    if (JR_APPLY_RE.test(t) || JR_SKIP_RE.test(t)) continue;
+    const cs = window.getComputedStyle(el);
+    const score = (parseFloat(cs.fontSize) || 0) + ((parseInt(cs.fontWeight, 10) || 400) >= 600 ? 4 : 0);
+    if (score > bestScore) { bestScore = score; best = t; }
+  }
+  return best;
+}
+function jrCardCompany(card, title) {
+  const img = card.querySelector("img[alt]");
+  const alt = img && img.alt ? img.alt.trim() : "";
+  if (alt && !/logo|icon|avatar|^$/i.test(alt)) return alt;
+  for (const el of card.querySelectorAll("*")) {
+    if (el.children.length) continue;
+    const t = visibleText(el);
+    if (!t || t === title || t.length > 80) continue;
+    if (JR_APPLY_RE.test(t) || JR_SKIP_RE.test(t)) continue;
+    if (/^\d+\s*[smhdw]$/i.test(t) || /[€£$]\s?\d/.test(t)) continue;
+    return t;
+  }
+  return "";
+}
+function jrBuildRow(card) {
+  const url = jrApplyUrl(card);
+  const title = jrCardTitle(card);
+  const chips = Array.from(card.querySelectorAll("span, div, button")).map(visibleText).filter(Boolean);
+  let work_mode = "", commitment = "", salary = "", posted_age = "";
+  for (const c of chips) {
+    const lc = c.toLowerCase();
+    if (!work_mode && CH_MODE_VALUES.has(lc)) work_mode = c;
+    else if (!commitment && CH_COMMIT_VALUES.has(lc)) commitment = c;
+    else if (!salary && CH_SALARY_RE.test(c) && c.length < 40) salary = c;
+    else if (!posted_age && CH_AGE_RE.test(c)) posted_age = c;
+  }
+  return {
+    url: url,
+    title: title,
+    company: jrCardCompany(card, title),
+    location: "",
+    salary: salary,
+    work_mode: work_mode,
+    commitment: commitment,
+    yoe: "",
+    posted_age: posted_age,
+    description: "",
+    skills: "",
+    job_posting_initial_url: url,
+    hiringcafe_viewall_url: location.href,
+    status: url ? "ok" : "no apply url found on card",
+    method: "jobright-apply-href",
+    scraped_at: new Date().toISOString()
+  };
+}
+// The recommend feed is infinite scroll: scrape what's rendered, scroll, repeat
+// until no new cards appear. Dedupe by URL (falling back to title|company) so a
+// re-render can't produce duplicate rows or an endless loop.
+async function jrRun(options) {
+  options = options || {};
+  aborted = false;
+  const start = Date.now();
+  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !jrGetCards().length) await sleep(150);
+  if (!jrGetCards().length) {
+    await send("SCRAPE_DONE", { error: 'No job cards found on jobright.ai — make sure the job list with "Apply now" / "Apply with autofill" buttons is visible.' });
+    return;
+  }
+  const seen = new Set();
+  let pageIndex = 0, noGrowth = 0, total = 0;
+  while (!aborted) {
+    pageIndex += 1;
+    const cards = jrGetCards();
+    let newThisPass = 0;
+    for (const card of cards) {
+      if (aborted) break;
+      const row = jrBuildRow(card);
+      const key = row.url || (row.title + "|" + row.company);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      try { card.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
+      await send("JOB_SCRAPED", { row });
+      newThisPass += 1; total += 1;
+      if (total % 4 === 0)
+        await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: total, status: "running" });
+    }
+    await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: total, status: "running" });
+    if (aborted) break;
+    if (newThisPass === 0) {
+      noGrowth += 1;
+      if (noGrowth >= APPEND_NO_GROWTH_TRIES) break;
+    } else noGrowth = 0;
+    const before = jrGetCards().length;
+    window.scrollBy({ top: SCROLL_STEP_PX, behavior: "auto" });
+    await sleep(SCROLL_PAUSE_MS);
+    if (jrGetCards().length === before) {
+      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
+      await sleep(SCROLL_PAUSE_MS);
+    }
+  }
+  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+}
+//                     end jobright.ai adapter
+
 async function runScrape(options) {
+  if (jrIsTarget()) { return jrRun(options); }
   if (chIsTarget()) { return chRun(options); }
   if (sjIsTarget()) { return sjRun(options); }
   if (ettIsTarget()) { return ettRun(options); }
