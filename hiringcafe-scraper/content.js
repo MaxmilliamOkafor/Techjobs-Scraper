@@ -920,17 +920,38 @@ const SJ_NO_GROWTH_TRIES = 5;
 function sjIsTarget() {
   return /(^|\.)simplify\.jobs$/i.test(location.hostname);
 }
+// Card lookup with progressive fallbacks, mirroring sj-main.js, so a testid or
+// class rename on simplify.jobs can't reduce this to zero cards.
+const SJ_CARD_SELECTORS = [
+  '[data-testid="job-card"]',
+  '[data-testid*="job-card" i]',
+  '[data-testid*="jobcard" i]',
+  '[data-testid*="job" i]',
+  'a[href*="job="]',
+  'a[href*="/jobs/"]'
+];
 function sjGetCardButtons() {
-  return Array.from(document.querySelectorAll('[data-testid="job-card"]'))
-    .map((c) => c.closest("button") || c)
-    .filter(isVisible);
+  for (const sel of SJ_CARD_SELECTORS) {
+    let els;
+    try { els = Array.from(document.querySelectorAll(sel)); } catch (_) { continue; }
+    if (!els.length) continue;
+    const out = [], seen = new Set();
+    for (const e of els) {
+      const c = e.closest("button, article, li, a") || e;
+      if (!seen.has(c) && isVisible(c)) { seen.add(c); out.push(c); }
+    }
+    if (out.length) return out;
+  }
+  return [];
 }
+let sjLastProbe = null;
 function sjRequestRows() {
   return new Promise((resolve) => {
     const nonce = Date.now() + ":" + Math.random();
     function onMsg(e) {
       if (e.source !== window || !e.data || e.data.__sjRes !== nonce) return;
       window.removeEventListener("message", onMsg);
+      sjLastProbe = e.data.probe || null;
       resolve(Array.isArray(e.data.rows) ? e.data.rows : []);
     }
     window.addEventListener("message", onMsg);
@@ -949,9 +970,13 @@ function sjSalary(r) {
 }
 function sjBuildRow(r) {
   const id = r.id || "";
-  const clickUrl = id ? ("https://simplify.jobs/jobs/click/" + id) : "";
+  // If the job object already carried an external apply URL, use it as-is — no
+  // /jobs/click/<id> redirect needed. Otherwise fall back to the click URL for
+  // the background worker to resolve.
+  const direct = isResolvedExternalUrl(r.apply_url) ? r.apply_url : "";
+  const clickUrl = direct || (id ? ("https://simplify.jobs/jobs/click/" + id) : "");
   return {
-    url: "",
+    url: direct,
     title: r.title || "",
     company: r.company || "",
     location: (r.locations || []).filter(Boolean).join(" | "),
@@ -963,9 +988,10 @@ function sjBuildRow(r) {
     description: (r.functions || []).filter(Boolean).join(" | "),
     skills: (r.majors || []).filter(Boolean).join(" | "),
     job_posting_initial_url: clickUrl,
-    hiringcafe_viewall_url: id ? (location.origin + "/jobs?jobId=" + id) : location.href,
-    status: clickUrl ? "pending" : "no job posting url on card",
-    method: "",
+    // simplify.jobs moved job routing to /search?job=<uuid> (was /jobs?jobId=).
+    hiringcafe_viewall_url: id ? (location.origin + "/search?job=" + id) : location.href,
+    status: direct ? "ok" : (clickUrl ? "pending" : "no job posting url on card"),
+    method: direct ? "hit-apply-url" : "",
     scraped_at: new Date().toISOString()
   };
 }
@@ -994,13 +1020,26 @@ async function sjRun() {
   aborted = false;
   const start = Date.now();
   while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !sjGetCardButtons().length) await sleep(150);
-  if (!sjGetCardButtons().length) { await send("SCRAPE_DONE", { error: "No job cards found on simplify.jobs." }); return; }
+  if (!sjGetCardButtons().length) { await send("SCRAPE_DONE", { error: "No job cards found on simplify.jobs — the page markup may have changed." }); return; }
 
   const seen = new Set();
-  let pageIndex = 0, noGrowth = 0;
+  let pageIndex = 0, noGrowth = 0, everGotRows = false;
   while (!aborted) {
     pageIndex += 1;
     const rawRows = await sjRequestRows();
+    // Cards are on screen but the MAIN-world fiber read returned nothing: report
+    // exactly where it broke instead of finishing with an empty, silent export.
+    if (!rawRows.length && !everGotRows) {
+      const p = sjLastProbe || {};
+      if (p.cardEls === 0 || p.withFiber === 0) {
+        await send("SCRAPE_DONE", {
+          error: "simplify.jobs: found " + (p.cardEls ?? "?") + " card element(s) but read job data from " +
+                 (p.withFiber ?? "?") + " of them — their page structure changed. Send the card HTML to fix the selectors."
+        });
+        return;
+      }
+    }
+    if (rawRows.length) everGotRows = true;
     const newRows = [];
     for (const r of rawRows) {
       if (r.id && seen.has(r.id)) continue;
@@ -1011,7 +1050,8 @@ async function sjRun() {
     let completed = 0;
     await Promise.all(newRows.map(async (row) => {
       if (aborted) return;
-      if (row.job_posting_initial_url) {
+      // Already have the employer URL straight off the job object — nothing to resolve.
+      if (!row.url && row.job_posting_initial_url) {
         const resp = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
         if (resp) {
           row.method = resp.method || "";
