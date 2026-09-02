@@ -94,6 +94,16 @@
     </div>
   </section>
 
+  <section id="diag-card">
+    <div class="card-title">Diagnostics</div>
+    <p class="hint">Scraper not finding jobs or URLs on a site? Capture the page
+      structure and paste it to whoever is fixing the selectors.</p>
+    <div class="actions csv-actions">
+      <button id="diag-btn" class="secondary">Copy page structure</button>
+    </div>
+    <pre id="diag-log" class="csv-log" aria-live="polite"></pre>
+  </section>
+
   <section id="csv-card">
     <div class="card-title">CSV → LazyApply Queue</div>
     <div id="csv-dropzone" tabindex="0" role="button" aria-label="Upload or drop CSV files">

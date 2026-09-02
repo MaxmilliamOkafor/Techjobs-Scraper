@@ -14,6 +14,8 @@ const SITE_MATCH = [
 const ON_SITE_RE = /(hiring\.cafe|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
 
 const els = {
+  diagBtn: document.getElementById("diag-btn"),
+  diagLog: document.getElementById("diag-log"),
   startBtn: document.getElementById("start-btn"),
   stopBtn: document.getElementById("stop-btn"),
   exportBtn: document.getElementById("export-btn"),
@@ -255,6 +257,80 @@ els.exportBtn.addEventListener("click", async () => {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   downloadCsv(csv, `tech-jobs-${stamp}.csv`);
 });
+
+// ---- Diagnostics: capture the page structure for selector debugging --------
+// Runs in the page and returns a compact, shareable snapshot: what job cards and
+// apply controls actually look like right now. Avoids guessing at selectors.
+function capturePageStructure() {
+  const txt = (el) => ((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim();
+  const clip = (s, n) => (s && s.length > n ? s.slice(0, n) + " …[truncated]" : s || "");
+  const hasFiber = (el) => !!(el && Object.keys(el).some((k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")));
+  const APPLY_RE = /\b(apply\s+with\s+autofill|apply\s+now|apply|job\s+posting)\b/i;
+
+  const applyControls = Array.from(document.querySelectorAll('a, button, [role="button"]'))
+    .filter((el) => APPLY_RE.test(txt(el)))
+    .slice(0, 4);
+
+  // Climb from an apply control to something card-sized.
+  const cardOf = (el) => {
+    let n = el, i = 0;
+    while (n && n !== document.body && i < 25) { if (txt(n).length > 60) return n; n = n.parentElement; i += 1; }
+    return el;
+  };
+  const cards = [];
+  const seen = new Set();
+  for (const c of applyControls) {
+    const card = cardOf(c);
+    if (card && !seen.has(card)) { seen.add(card); cards.push(card); }
+  }
+
+  const lines = [];
+  lines.push("URL: " + location.href);
+  lines.push("Host: " + location.hostname);
+  lines.push("Job-ish links: " + document.querySelectorAll('a[href*="/job/"], a[href*="/jobs/"], a[href*="job="]').length);
+  lines.push("[data-testid] nodes: " + document.querySelectorAll("[data-testid]").length);
+  const testids = Array.from(new Set(Array.from(document.querySelectorAll("[data-testid]"))
+    .map((e) => e.getAttribute("data-testid")).filter(Boolean))).slice(0, 25);
+  lines.push("data-testid values: " + (testids.join(", ") || "(none)"));
+  lines.push("Apply-ish controls found: " + applyControls.length);
+  lines.push("React fiber on first control: " + (applyControls[0] ? hasFiber(applyControls[0]) : "n/a"));
+  lines.push("");
+  applyControls.slice(0, 2).forEach((c, i) => {
+    lines.push("--- APPLY CONTROL " + (i + 1) + " (<" + c.tagName.toLowerCase() + ">, text: " + JSON.stringify(txt(c)) + ") ---");
+    lines.push(clip(c.outerHTML, 1200));
+    lines.push("");
+  });
+  cards.slice(0, 2).forEach((c, i) => {
+    lines.push("--- CARD " + (i + 1) + " ---");
+    lines.push(clip(c.outerHTML, 3000));
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+if (els.diagBtn) {
+  els.diagBtn.addEventListener("click", async () => {
+    els.diagLog.textContent = "Capturing…";
+    try {
+      const tabs = await chrome.tabs.query({ url: SITE_MATCH });
+      if (!tabs.length) { els.diagLog.textContent = "Open a supported job site in a tab first."; return; }
+      tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id }, func: capturePageStructure, world: "MAIN"
+      });
+      const out = (res && res.result) || "(no output)";
+      els.diagLog.textContent = out;
+      try {
+        await navigator.clipboard.writeText(out);
+        els.diagLog.textContent = "✔ Copied to clipboard — paste it to whoever is fixing the selectors.\n\n" + out;
+      } catch (_) {
+        els.diagLog.textContent = "(Clipboard blocked — select the text below and copy manually.)\n\n" + out;
+      }
+    } catch (e) {
+      els.diagLog.textContent = "Capture failed: " + (e?.message || e);
+    }
+  });
+}
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "STATE_UPDATE") refresh();

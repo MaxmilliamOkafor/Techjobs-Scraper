@@ -31,6 +31,39 @@
     if (!u || !/^https?:\/\//i.test(u)) return false;
     try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
   }
+  // Ask the MAIN-world helper (fiber-main.js) for apply URLs read straight out of
+  // React state. Returns { byHref, byTitle, probe }. Boards like hiring.cafe hold
+  // the employer URL only in React state — never in the DOM or the fetched HTML —
+  // so this is the reliable source; network resolution is the fallback.
+  let fiberProbe = null;
+  function fiberRequestUrls(timeoutMs = 4000) {
+    return new Promise((resolve) => {
+      const empty = { byHref: new Map(), byTitle: new Map(), probe: null };
+      const nonce = Date.now() + ":" + Math.random();
+      let done = false;
+      function finish(res) {
+        if (done) return;
+        done = true;
+        window.removeEventListener("message", onMsg);
+        resolve(res);
+      }
+      function onMsg(e) {
+        if (e.source !== window || !e.data || e.data.__tjsFiberRes !== nonce) return;
+        const byHref = new Map(), byTitle = new Map();
+        for (const it of (e.data.entries || [])) {
+          if (!it || !it.url) continue;
+          if (it.href) byHref.set(it.href, it.url);
+          if (it.title) byTitle.set(it.title, it.url);
+        }
+        fiberProbe = e.data.probe || null;
+        finish({ byHref, byTitle, probe: e.data.probe || null });
+      }
+      window.addEventListener("message", onMsg);
+      try { window.postMessage({ __tjsFiberReq: nonce }, "*"); }
+      catch (_) { finish(empty); return; }
+      setTimeout(() => finish(empty), timeoutMs);
+    });
+  }
   function send(type, payload = {}) {
     return new Promise((resolve) => {
       try {
@@ -523,10 +556,18 @@
     await send("PAGE_PROGRESS", {
       pageIndex: currentPage, totalPages, scrapedThisPage: 0, status: "running"
     });
+    // FIRST: apply URLs straight from React state. hiring.cafe keeps the employer
+    // URL only there, so this resolves rows the network fetch never could.
+    const fiber = await fiberRequestUrls();
     let completed = 0;
     await Promise.all(rows.map(async (row) => {
       if (aborted) return;
-      if (row.job_posting_initial_url) {
+      const fromFiber = row.job_posting_initial_url ? fiber.byHref.get(row.job_posting_initial_url) : null;
+      if (fromFiber && isResolvedExternalUrl(fromFiber)) {
+        row.url = fromFiber;
+        row.status = "ok";
+        row.method = "fiber-apply-url";
+      } else if (row.job_posting_initial_url) {
         const r = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
         if (r) {
           row.method = r.method || "";
@@ -1417,11 +1458,25 @@ async function jrRun(options) {
   let pageIndex = 0, noGrowth = 0, total = 0;
   while (!aborted) {
     pageIndex += 1;
+    // Jobright's apply URL may live only in React state (the button can be a
+    // handler with no href), so ask the MAIN-world helper as well.
+    const fiber = await fiberRequestUrls();
     const cards = jrGetCards();
     let newThisPass = 0;
     for (const card of cards) {
       if (aborted) break;
       const row = jrBuildRow(card);
+      if (!row.url) {
+        const h = card.querySelector("h1,h2,h3,h4,h5,h6");
+        const key = h ? visibleText(h) : visibleText(card).slice(0, 80);
+        const fromFiber = fiber.byTitle.get(key) || (row.title && fiber.byTitle.get(row.title));
+        if (fromFiber && isResolvedExternalUrl(fromFiber)) {
+          row.url = fromFiber;
+          row.job_posting_initial_url = fromFiber;
+          row.status = "ok";
+          row.method = "fiber-apply-url";
+        }
+      }
       const key = row.url || (row.title + "|" + row.company);
       if (!key || seen.has(key)) continue;
       seen.add(key);

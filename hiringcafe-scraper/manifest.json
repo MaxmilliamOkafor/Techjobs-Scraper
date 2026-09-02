@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tech Jobs URL Scraper",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, and hnhiring.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
   "permissions": [
     "tabs",
@@ -78,6 +78,21 @@
       "js": [
         "hnhiring.js"
       ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://hiring.cafe/*",
+        "https://*.hiring.cafe/*",
+        "https://jobright.ai/*",
+        "https://*.jobright.ai/*",
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*"
+      ],
+      "js": [
+        "fiber-main.js"
+      ],
+      "world": "MAIN",
       "run_at": "document_idle"
     }
   ]
