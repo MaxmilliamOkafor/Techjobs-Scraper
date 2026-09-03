@@ -239,19 +239,20 @@
     setVal(url); // then set the URL
     fire("change");
 
-    // Wait for React to re-render and enable the button. Poll FAST (5ms) and
-    // break the instant it's ready, instead of sleeping a fixed 150ms per try —
-    // React usually enables it within a frame or two, so this is the single
-    // biggest speed win per URL. Same 600ms worst case as before.
+    // Wait for React to re-render and enable the button. Check immediately, then
+    // poll with a BACKING-OFF interval: fast when the page is keeping up, but
+    // cheap when it isn't. findAddButton() scans every button on the page, so a
+    // flat 5ms poll here was hammering the DOM and helping crash the tab.
     let btn = null;
-    const btnDeadline = Date.now() + 600;
-    let ticks = 0;
+    const btnDeadline = Date.now() + 800;
+    let iv = 10, ticks = 0;
     for (;;) {
       btn = findAddButton(input);
       if (btn && !btn.disabled) break;
       if (Date.now() >= btnDeadline) break;
-      await sleep(5);
-      if (++ticks % 20 === 0) fire("input"); // nudge React periodically
+      await sleep(iv);
+      if (iv < 120) iv = Math.min(120, Math.round(iv * 1.6));
+      if (++ticks % 4 === 0) fire("input"); // nudge React periodically
     }
 
     if (!btn) {
@@ -265,15 +266,19 @@
     btn.click();
 
     // Confirmation: on a successful add MUI clears the field and the button
-    // returns to disabled. Poll at 5ms so we return the moment it lands rather
-    // than waiting out a 100ms tick; same ~2.5s worst case as before.
+    // returns to disabled. Check the CHEAP signal (btn.disabled) before the
+    // expensive findInput() scan, and back the interval off so a slow add costs
+    // a handful of DOM scans rather than hundreds.
     let confirmed = false;
     const confDeadline = Date.now() + 2500;
+    let civ = 10;
     for (;;) {
+      if (btn.disabled) { confirmed = true; break; }
       const cur = findInput();
-      if ((cur && cur.value === "") || btn.disabled) { confirmed = true; break; }
+      if (cur && cur.value === "") { confirmed = true; break; }
       if (Date.now() >= confDeadline) break;
-      await sleep(5);
+      await sleep(civ);
+      if (civ < 120) civ = Math.min(120, Math.round(civ * 1.6));
     }
     return { ok: true, via: "click", confirmed };
   }
@@ -298,11 +303,12 @@
     els.fileInput.disabled = true;
     els.dropzone.classList.add("disabled");
 
-    const delay = 1; // fixed 1ms between adds (no user toggle)
+    let pace = 1;        // ms between adds; adapts upward if the page struggles
+    let injectFails = 0; // consecutive executeScript failures (crashed/reloading tab)
     let added = 0;
     const failed = [];
     const startAt = nextIndex;
-    log(`\n▶ Adding ${masterList.length - startAt} URL(s) (from #${startAt + 1}) — ~${delay}ms apart.\n`);
+    log(`\n▶ Adding ${masterList.length - startAt} URL(s) (from #${startAt + 1}).\n`);
 
     let i = startAt;
     for (; i < masterList.length; i++) {
@@ -326,20 +332,37 @@
         const r = res && res.result;
         if (r && r.ok) {
           added++;
+          injectFails = 0;
+          if (r.confirmed) pace = Math.max(1, pace - 5);
+          else pace = Math.min(400, pace * 2 + 10);
           log(`Adding ${i + 1}/${masterList.length} ✓${r.confirmed ? "" : " (unconfirmed)"}  ${url}`);
         } else {
+          injectFails = 0;
           failed.push({ url, error: (r && r.error) || "unknown" });
           log(`Adding ${i + 1}/${masterList.length} ✗  ${url}  — ${(r && r.error) || "failed"}`);
         }
       } catch (e) {
-        failed.push({ url, error: e?.message || String(e) });
-        log(`Adding ${i + 1}/${masterList.length} ✗  ${url}  — ${e?.message || e}`);
+        // The tab crashed or is reloading. Previously this just marked the URL
+        // failed and moved on, so a crash silently burned through the whole
+        // remaining list — which is why it "stopped before adding all". Now we
+        // retry, then PAUSE with the resume point saved.
+        injectFails += 1;
+        if (injectFails >= 4) {
+          nextIndex = i; persistQueueState();
+          log(`\n■ Lost the LazyApply tab at ${i}/${masterList.length} (${e?.message || e}).`);
+          log(`  Reload https://app.lazyapply.com/dashboard, then click "Add to LazyApply Queue" to resume from #${i + 1}.`);
+          break;
+        }
+        log(`⚠ Page busy, retrying ${i + 1}/${masterList.length}… (${injectFails}/3)`);
+        await sleep(600 * injectFails);
+        i -= 1;          // retry this same URL
+        continue;
       }
       // Advance the resume pointer AFTER each URL is processed and persist it, so
       // a mid-run teardown resumes here instead of restarting from the top.
       nextIndex = i + 1;
       persistQueueState();
-      await sleep(delay);
+      await sleep(pace);
     }
 
     running = false;

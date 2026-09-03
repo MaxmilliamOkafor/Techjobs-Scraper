@@ -41,9 +41,13 @@
     return tabs[0];
   }
 
-  // Injected into the LazyApply tab. Removes ONE matching row per call.
-  // filters = array of lowercased substrings ([] = match anything).
-  async function removeOneRowInPage(filters) {
+  // Injected into the LazyApply tab. Removes UP TO maxPerCall matching rows per
+  // call. Batching matters: scanning every button + every <tbody tr> is O(queue
+  // size), so doing it once per row (with a 1ms gap) meant tens of thousands of
+  // full-table scans on a large queue — which pegged the CPU and crashed the tab.
+  // One scan now covers a whole batch, and waiting for a removal uses a cheap
+  // node-detached check with backoff instead of re-counting rows every 5ms.
+  async function removeRowsInPage(filters, maxPerCall) {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const rowText = (tr) => (tr.innerText || "").replace(/\s+/g, " ").trim();
     const matches = (tr) => {
@@ -55,48 +59,58 @@
       Array.from(document.querySelectorAll('button, [role="button"]')).filter(
         (b) => /^\s*remove\s*$/i.test(b.textContent || "") && !b.disabled && b.offsetParent !== null
       );
-    const renderedRows = () => Array.from(document.querySelectorAll("tbody tr"));
+    const rowCount = () => document.querySelectorAll("tbody tr").length;
 
-    let target = null;
-    for (const btn of removeButtons()) {
-      const tr = btn.closest("tr");
-      if (tr && matches(tr)) { target = { btn, tr }; break; }
+    // Wait for a node to leave the DOM. document.body.contains() is a cheap
+    // tree walk with no querySelectorAll, and the interval backs off so a slow
+    // removal costs a handful of checks rather than hundreds.
+    async function waitDetached(node, timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      let iv = 10;
+      while (document.body.contains(node)) {
+        if (Date.now() >= deadline) return false;
+        await sleep(iv);
+        if (iv < 120) iv = Math.min(120, Math.round(iv * 1.6));
+      }
+      return true;
     }
 
-    if (!target) {
+    const removed = [];
+    let unconfirmed = 0;
+    // ONE scan for the whole batch. Removing a row leaves the other rows' nodes
+    // intact, so the snapshot stays valid; stale entries are simply skipped.
+    const btns = removeButtons();
+    for (const b of btns) {
+      if (removed.length >= maxPerCall) break;
+      if (!document.body.contains(b)) continue;
+      const tr = b.closest("tr");
+      if (!tr || !matches(tr)) continue;
+      const label = rowText(tr).slice(0, 80);
+      try { b.click(); } catch (_) { continue; }
+      if (!(await waitDetached(b, 2500))) unconfirmed += 1;
+      removed.push(label);
+    }
+
+    if (removed.length === 0) {
+      // Nothing matched on screen — try to reveal more rows before declaring done.
       const showMore = Array.from(document.querySelectorAll("button")).find(
         (b) => /show more/i.test(b.textContent || "") && !b.disabled && b.offsetParent !== null
       );
       if (showMore) {
-        const before = renderedRows().length;
+        const before = rowCount();
         showMore.click();
-        // Poll fast for the newly rendered rows instead of fixed 150ms ticks.
-        const smDeadline = Date.now() + 3000;
-        while (Date.now() < smDeadline) { if (renderedRows().length > before) break; await sleep(5); }
-        for (const btn of removeButtons()) {
-          const tr = btn.closest("tr");
-          if (tr && matches(tr)) { target = { btn, tr }; break; }
+        const deadline = Date.now() + 4000;
+        let iv = 20;
+        while (Date.now() < deadline) {
+          if (rowCount() > before) break;
+          await sleep(iv);
+          if (iv < 150) iv = Math.min(150, Math.round(iv * 1.6));
         }
-        if (!target) return { ok: true, done: true, removed: null, remaining: renderedRows().length };
-      } else {
-        return { ok: true, done: true, removed: null, remaining: renderedRows().length };
+        return { ok: true, done: false, removed: [], unconfirmed: 0, grew: rowCount() > before, remaining: rowCount() };
       }
+      return { ok: true, done: true, removed: [], unconfirmed: 0, remaining: rowCount() };
     }
-
-    const label = rowText(target.tr).slice(0, 80);
-    const before = renderedRows().length;
-    target.btn.click();
-
-    // Poll at 5ms so each delete returns the moment the row disappears rather
-    // than waiting out a 100ms tick; same ~2.5s worst case as before.
-    let confirmed = false;
-    const delDeadline = Date.now() + 2500;
-    for (;;) {
-      if (!document.body.contains(target.btn) || renderedRows().length < before) { confirmed = true; break; }
-      if (Date.now() >= delDeadline) break;
-      await sleep(5);
-    }
-    return { ok: true, done: false, removed: label, confirmed, remaining: renderedRows().length };
+    return { ok: true, done: false, removed, unconfirmed, remaining: rowCount() };
   }
 
   function parseFilters() {
@@ -114,33 +128,67 @@
       log("⚠ Filter mode is on but no filter text was entered. Try: lever, dandy"); return;
     }
 
-    const delay = 1; // fixed 1ms between deletes (no user toggle)
+    const DELETE_BATCH = 25;   // rows removed per injected call (amortises DOM scans)
+    let pace = 10;             // ms between batches; adapts if the page struggles
     const rawMax = parseInt(els.maxInput?.value, 10);
     const maxDeletes = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : Infinity;
 
     running = true; stopRequested = false;
     els.startBtn.disabled = true; els.stopBtn.disabled = false;
-    [els.modeAll, els.modeFilter, els.filterInput, els.delayInput, els.maxInput].forEach((e) => e && (e.disabled = true));
+    [els.modeAll, els.modeFilter, els.filterInput, els.maxInput].forEach((e) => e && (e.disabled = true));
     clearLog(); setProgress(0);
     log(filters.length
-      ? '▶ Deleting queue jobs matching: ' + filters.join(", ") + ' — ~' + delay + 'ms apart.\n'
-      : '▶ Deleting ALL queued jobs — ~' + delay + 'ms apart.\n');
+      ? '\u25b6 Deleting queue jobs matching: ' + filters.join(", ") + '\n'
+      : '\u25b6 Deleting ALL queued jobs\n');
 
-    let removed = 0, emptyStreak = 0;
+    let removed = 0, emptyStreak = 0, failStreak = 0;
     while (!stopRequested && removed < maxDeletes) {
-      let res;
+      const want = Math.min(DELETE_BATCH, maxDeletes - removed);
+      let res = null;
+      const t0 = Date.now();
       try {
-        const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: removeOneRowInPage, args: [filters] });
+        const [r] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, func: removeRowsInPage, args: [filters, want]
+        });
         res = r && r.result;
-      } catch (e) { log("✗ Injection failed: " + (e?.message || e)); break; }
-      if (!res || !res.ok) { log("✗ Unexpected page response — stopping."); break; }
+        failStreak = 0;
+      } catch (e) {
+        // A crashed/reloading tab throws here. Back off and retry a few times
+        // rather than aborting the whole run on one transient failure.
+        failStreak += 1;
+        if (failStreak >= 4) {
+          log("\u2717 Lost the LazyApply tab (" + (e?.message || e) + ").");
+          log("  Reload https://app.lazyapply.com/dashboard, then click Delete from Queue again.");
+          break;
+        }
+        log("\u26a0 Page busy, retrying\u2026 (" + failStreak + "/3)");
+        await sleep(600 * failStreak);
+        continue;
+      }
+      if (!res || !res.ok) { log("\u2717 Unexpected page response \u2014 stopping."); break; }
 
-      if (res.done || res.removed === null) { if (++emptyStreak >= 2) break; await sleep(delay); continue; }
-      emptyStreak = 0; removed++;
-      log(removed + ". ✓" + (res.confirmed ? "" : " (unconfirmed)") + " " + res.removed +
-        (Number.isFinite(maxDeletes) ? "   [" + removed + "/" + maxDeletes + "]" : ""));
+      const batch = Array.isArray(res.removed) ? res.removed : [];
+      if (batch.length === 0) {
+        if (res.grew) { emptyStreak = 0; await sleep(pace); continue; }  // Show More revealed rows
+        if (++emptyStreak >= 2) break;
+        await sleep(pace);
+        continue;
+      }
+      emptyStreak = 0;
+      for (const label of batch) {
+        removed += 1;
+        log(removed + ". \u2713 " + label +
+          (Number.isFinite(maxDeletes) ? "   [" + removed + "/" + maxDeletes + "]" : ""));
+      }
+      if (res.unconfirmed) log("  (" + res.unconfirmed + " unconfirmed in this batch)");
       if (Number.isFinite(maxDeletes)) setProgress(removed / maxDeletes);
-      await sleep(delay);
+
+      // Adaptive pacing: if the page is slow to remove rows, give it more room;
+      // if it is keeping up, tighten back toward the floor.
+      const perRow = (Date.now() - t0) / batch.length;
+      if (res.unconfirmed || perRow > 250) pace = Math.min(500, Math.round(pace * 2) + 10);
+      else pace = Math.max(10, pace - 10);
+      await sleep(pace);
     }
 
     setProgress(1); running = false; els.stopBtn.disabled = true;
