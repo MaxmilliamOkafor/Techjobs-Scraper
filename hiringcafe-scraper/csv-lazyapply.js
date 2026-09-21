@@ -203,7 +203,7 @@
       `${perFile.length} file(s) scanned\n${lines.join("\n")}` +
       `\n\nSupported (pre-dedupe): ${totalRaw}\nUnique to add: ${master.length}` +
       (resumed > 0 ? `\nAlready added: ${resumed} — will resume from #${resumed + 1}` : "");
-    els.startBtn.disabled = master.length === 0;
+    els.startBtn.disabled = false;   // stays live; runQueue says what is missing
     setProgress(master.length ? nextIndex / master.length : 0);
     log(
       master.length
@@ -362,7 +362,27 @@
   }
 
   async function runQueue() {
-    if (running || !masterList.length) return;
+    if (running) return;
+
+    // A DISABLED BUTTON EXPLAINS NOTHING.
+    //
+    // This used to return silently on an empty list, and the button was
+    // disabled on top of that, so "click it and nothing happens" was the
+    // entire experience -- with no way to tell an empty list from a
+    // broken one. The button stays live and says which it is.
+    if (!masterList.length) {
+      log("Nothing loaded to add. Drop in a CSV of job URLs first \u2014 Greenhouse,");
+      log("Lever, Ashby or Rippling postings. A file of search URLs will not do it.");
+      return;
+    }
+
+    // Nor does an empty page. Checked BEFORE announcing the run, which
+    // otherwise printed "Adding 240 URL(s)" and then paused at 0/240.
+    if (!(await findLazyApplyTab())) {
+      log("No LazyApply tab is open. Open https://app.lazyapply.com/dashboard on the");
+      log('Job Queue, leave it open, then click "Add to LazyApply Queue" again.');
+      return;
+    }
 
     // A completed list re-run from scratch when the user clicks again.
     if (nextIndex >= masterList.length) { nextIndex = 0; persistQueueState(); }
@@ -440,7 +460,7 @@
     els.stopBtn.disabled = true;
     els.fileInput.disabled = false;
     els.dropzone.classList.remove("disabled");
-    els.startBtn.disabled = masterList.length === 0;
+    els.startBtn.disabled = false;
 
     if (nextIndex >= masterList.length) {
       // Whole list finished — clear saved progress so the next upload starts clean.

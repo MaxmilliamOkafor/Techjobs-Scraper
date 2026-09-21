@@ -140,5 +140,43 @@ console.log('\nAND THE SUMMARY ACTUALLY USES ANY OF THAT');
   t('  the no-rows case is separate', /no readable rows/.test(src), 'a parse failure reads as 0 supported');
 }
 
+console.log('\nAND PRESSING THE BUTTON ALWAYS PRODUCES AN ANSWER');
+{
+  // Reported as "can't add the URLs to Add to LazyApply Queue". Two dead
+  // ends met there. runQueue() opened with `if (running ||
+  // !masterList.length) return;` -- a silent return -- and the button
+  // was disabled whenever the list was empty, so pressing it did
+  // nothing and said nothing, and an empty list looked exactly like a
+  // broken extension.
+  //
+  // The second was subtler: with no LazyApply tab open, the run
+  // announced "Adding 240 URL(s)" and then paused at 0/240 on the first
+  // iteration, which reads as a crash rather than as a missing tab.
+  const html = fs.readFileSync(path.join(__dirname, 'popup.html'), 'utf8');
+  const btn = (html.match(/<button id="csv-start-btn"[^>]*>/) || [''])[0];
+  t('  the button does not start life disabled', !/disabled/.test(btn), btn);
+  t('  ...and is not disabled again when a file yields nothing',
+    !/startBtn\.disabled = master(List)?\.length === 0/.test(src),
+    'a dead button is the whole symptom');
+
+  // Far enough in to reach the "Adding N URL(s)" announcement, which is
+  // the line the tab check has to come before.
+  const head = src.slice(src.indexOf('async function runQueue'),
+    src.indexOf('async function runQueue') + 2200);
+  t('  an empty list is explained, not swallowed',
+    /Nothing loaded to add/.test(head) && !/if \(running \|\| !masterList\.length\) return;/.test(src),
+    'the silent return is still there');
+  t('  ...and it names what the file should have held',
+    /Greenhouse,/.test(head) && /search URLs will not do it/.test(head),
+    'no way to know what was wrong with the file');
+  t('  a missing LazyApply tab is caught before the run is announced',
+    head.indexOf('No LazyApply tab is open') < head.indexOf('▶ Adding'),
+    'it would print "Adding N URL(s)" and then immediately pause at 0');
+  t('  ...and says where to open it',
+    /app\.lazyapply\.com\/dashboard/.test(head), 'nowhere to go from the message');
+  t('  the run still guards against double-starting',
+    /if \(running\) return;/.test(head), 'a second click would start a parallel run');
+}
+
 console.log('\n' + PASS + ' passed, ' + FAIL + ' failed');
 process.exit(FAIL ? 1 : 0);
