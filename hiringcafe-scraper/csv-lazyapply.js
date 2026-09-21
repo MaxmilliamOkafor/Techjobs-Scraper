@@ -210,7 +210,7 @@
         ? (resumed > 0
             ? `Loaded ${master.length} URL(s). ${resumed} already added — click "Add to LazyApply Queue" to resume from #${resumed + 1}.`
             : `Loaded ${master.length} unique supported URL(s). Open the LazyApply Job Queue, then click "Add to LazyApply Queue".`)
-        : "No supported ATS URLs found in those file(s)."
+        : ""   // the specific reason is logged just below; this said nothing
     );
 
     // Say WHY nothing came through. The three reasons need three
