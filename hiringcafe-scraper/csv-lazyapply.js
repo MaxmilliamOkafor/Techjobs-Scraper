@@ -7,16 +7,38 @@
   // LazyApply dashboard. We drive whichever tab is open on this origin.
   const LAZYAPPLY_MATCH = ["https://app.lazyapply.com/*"];
 
-  // A Job URL is kept ONLY if it contains one of these. Everything else
+  /** The host, so a URL is judged by where it points, not by its text. */
+  function hostOf(url) {
+    try { return new URL(url).hostname.replace(/^www\./, ""); }
+    catch (_) { return ""; }
+  }
+
+  // A Job URL is kept ONLY if its HOST is one of these. Everything else
   // (LinkedIn, Workday, SmartRecruiters, Personio, Indeed, …) is ignored.
-  const ATS_PATTERNS = [
-    /job-boards\.greenhouse\.io/i,
-    /job-boards\.eu\.greenhouse\.io/i,
-    /jobs\.lever\.co/i,
-    /jobs\.ashbyhq\.com/i,
-    /ats\.rippling\.com/i,
+  //
+  // Anchored, and matched against the parsed hostname rather than tested
+  // against the whole URL string. Testing the string accepts anything
+  // that merely MENTIONS a supported domain: a Boolean job search of the
+  // form site:greenhouse.io OR site:rippling-ats.com carries those
+  // domains in its own query and would be queued as if it were a job.
+  //
+  // Each platform is one pattern covering every host form it ships, not
+  // one per spelling. Greenhouse serves the same posting from
+  // boards.greenhouse.io and job-boards.greenhouse.io, and its own API
+  // returns the first of those in absolute_url; Lever has an EU host.
+  // Listing only some of the spellings counts a real, live posting on a
+  // supported platform as unsupported.
+  const ATS_HOSTS = [
+    /^(?:job-)?boards\.(?:eu\.)?greenhouse\.io$/i,
+    /^jobs\.(?:eu\.)?lever\.co$/i,
+    /^jobs\.ashbyhq\.com$/i,
+    /^ats\.rippling\.com$/i,
+    /^(?:[a-z0-9-]+\.)?rippling-ats\.com$/i,
   ];
-  const isSupported = (url) => ATS_PATTERNS.some((re) => re.test(url));
+  function isSupported(url) {
+    const h = hostOf(url);
+    return !!h && ATS_HOSTS.some((re) => re.test(h));
+  }
 
   const els = {
     card: document.getElementById("csv-card"),
@@ -99,11 +121,20 @@
     );
   }
 
-  function extractUrls(text) {
+  // Returns the supported URLs AND what it turned away.
+  //
+  // "0 supported" on its own is a dead end: it looks identical whether
+  // the file failed to parse, held no URLs at all, or held four hundred
+  // perfectly good URLs from a platform this tool does not drive. Those
+  // need three different answers, so the count is reported alongside the
+  // hosts that produced it.
+  function scanCsv(text) {
     const rows = parseCsv(text).filter((r) => r.some((c) => c && c.trim()));
-    if (!rows.length) return [];
+    if (!rows.length) return { urls: [], rejected: 0, hosts: [], rows: 0, column: -1 };
     const col = findUrlColumn(rows[0]);
     const out = [];
+    const seenHosts = new Map();
+    let rejected = 0;
     const start = col === -1 ? 0 : 1; // no header match → scan every row/cell
     for (let r = start; r < rows.length; r++) {
       const cells = col === -1 ? rows[r] : [rows[r][col]];
@@ -111,11 +142,19 @@
         if (!cell) continue;
         const m = String(cell).match(/https?:\/\/[^\s",]+/);
         let url = (m ? m[0] : String(cell).trim()).replace(/[)\].,;]+$/, "");
-        if (url && isSupported(url)) out.push(url);
+        if (!url) continue;
+        if (isSupported(url)) { out.push(url); continue; }
+        if (!/^https?:\/\//i.test(url)) continue;  // not a URL at all, not a rejection
+        rejected++;
+        const h = hostOf(url) || "?";
+        seenHosts.set(h, (seenHosts.get(h) || 0) + 1);
       }
     }
-    return out;
+    const hosts = [...seenHosts.entries()].sort((a, b) => b[1] - a[1]);
+    return { urls: out, rejected, hosts, rows: rows.length - (col === -1 ? 0 : 1), column: col };
   }
+
+  function extractUrls(text) { return scanCsv(text).urls; }
 
   async function readFiles(fileList) {
     const files = Array.from(fileList);
@@ -123,11 +162,12 @@
     const seen = new Set();
     const master = [];
     for (const f of files) {
-      let urls = [];
-      try { urls = extractUrls(await f.text()); }
+      let scan = { urls: [], rejected: 0, hosts: [], rows: 0 };
+      try { scan = scanCsv(await f.text()); }
       catch (e) { log(`⚠ Could not read ${f.name}: ${e?.message || e}`); }
-      perFile.push({ name: f.name, count: urls.length });
-      for (const u of urls) if (!seen.has(u)) { seen.add(u); master.push(u); }
+      perFile.push({ name: f.name, count: scan.urls.length,
+        rejected: scan.rejected, hosts: scan.hosts, rows: scan.rows });
+      for (const u of scan.urls) if (!seen.has(u)) { seen.add(u); master.push(u); }
     }
     return { perFile, master };
   }
@@ -153,7 +193,12 @@
     } catch (_) { nextIndex = 0; }
     persistQueueState();
     const totalRaw = perFile.reduce((a, b) => a + b.count, 0);
-    const lines = perFile.map((p) => `  • ${p.name}: ${p.count} supported`);
+    const lines = perFile.map((p) => {
+      let line = `  • ${p.name}: ${p.count} supported`;
+      if (p.rejected) line += `, ${p.rejected} skipped`;
+      if (!p.count && !p.rejected && !p.rows) line += " (no rows read)";
+      return line;
+    });
     els.summary.textContent =
       `${perFile.length} file(s) scanned\n${lines.join("\n")}` +
       `\n\nSupported (pre-dedupe): ${totalRaw}\nUnique to add: ${master.length}` +
@@ -167,6 +212,32 @@
             : `Loaded ${master.length} unique supported URL(s). Open the LazyApply Job Queue, then click "Add to LazyApply Queue".`)
         : "No supported ATS URLs found in those file(s)."
     );
+
+    // Say WHY nothing came through. The three reasons need three
+    // different fixes and the count alone distinguishes none of them.
+    if (!master.length) {
+      const allHosts = new Map();
+      let anyRows = 0;
+      for (const p of perFile) {
+        anyRows += p.rows || 0;
+        for (const [h, n] of p.hosts || []) allHosts.set(h, (allHosts.get(h) || 0) + n);
+      }
+      if (!anyRows) {
+        log("The file had no readable rows. Check it is a CSV with a header row.");
+      } else if (!allHosts.size) {
+        log(`Read ${anyRows} row(s) but found no URLs in them. The column holding the`);
+        log('links should be named "Job URL" or "url".');
+      } else {
+        const top = [...allHosts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+        log(`Read ${anyRows} row(s) and found URLs, but none on a platform this tool drives.`);
+        log("What was in the file: " + top.map(([h, n]) => `${h} (${n})`).join(", "));
+        log("It queues job postings on: Greenhouse, Lever, Ashby, Rippling.");
+        if (top.some(([h]) => /google\.|bing\.|duckduckgo\./i.test(h))) {
+          log("Those are SEARCH pages, not job postings. Export the job URLs themselves");
+          log("rather than the searches that find them.");
+        }
+      }
+    }
   }
 
   // ---- Page automation (runs in the LazyApply tab) -----------------------
