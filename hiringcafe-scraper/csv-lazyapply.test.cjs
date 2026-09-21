@@ -177,8 +177,12 @@ console.log('\nAND PRESSING THE BUTTON ALWAYS PRODUCES AN ANSWER');
   t('  ...and it names what the file should have held',
     /Greenhouse, Lever, Ashby or/.test(head) && /search pages that list them/.test(head),
     'no way to know what was wrong with the file');
+  // The announcement now lives in drainQueue (so each batch of freshly found
+  // links announces itself), and drainQueue is defined above runQueue — so a
+  // source-order check for the banner no longer works. The property being
+  // guarded is unchanged: runQueue must prove a tab exists BEFORE it drains.
   t('  a missing LazyApply tab is caught before the run is announced',
-    head.indexOf('No LazyApply tab is open') < head.indexOf('▶ Adding'),
+    head.indexOf('No LazyApply tab is open') < head.indexOf('await drainQueue()'),
     'it would print "Adding N URL(s)" and then immediately pause at 0');
   t('  ...and says where to open it',
     /app\.lazyapply\.com\/dashboard/.test(head), 'nowhere to go from the message');

@@ -420,6 +420,12 @@
         found += here;
         log(`Search ${searchIndex + 1}/${searchList.length}: ${here} new job link(s)`);
         persistQueueState();
+        // Queue what we just found, right now. Waiting for all 153 search pages
+        // before the first add meant ~9 minutes of nothing going into the field.
+        if (here) {
+          const st = await drainQueue();
+          if (st === "stopped" || st === "lost-tab") return false;
+        }
         // Human-ish pacing between result pages keeps the engine from
         // challenging every request.
         await sleep(2500 + Math.round(Math.random() * 2500));
@@ -606,7 +612,7 @@
     // page leaves its busy state), then read the outcome.
     const clickedAt = Date.now();
     const confDeadline = clickedAt + 30000;
-    let civ = 50, sawBusy = false;
+    let civ = 25, sawBusy = false;   // tight poll: return the instant the field clears
     await sleep(civ);                 // let React enter its busy state
     for (;;) {
       const cur = findInput();
@@ -626,7 +632,7 @@
       }
       if (Date.now() >= confDeadline) return { ok: true, via: "click", confirmed: false };
       await sleep(civ);
-      if (civ < 250) civ = Math.min(250, Math.round(civ * 1.5));
+      if (civ < 100) civ = Math.min(100, Math.round(civ * 1.5));
     }
   }
 
@@ -635,6 +641,84 @@
     if (!tabs.length) return null;
     tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
     return tabs[0];
+  }
+
+  // ---- the add loop, callable more than once -----------------------------
+  // Adds every URL from nextIndex to the end of masterList, one at a time:
+  // paste into the LazyApply queue field, click "Add to Queue", confirm, repeat.
+  // Pulled out of runQueue so search-page harvesting can call it after EACH page
+  // and URLs start going in immediately, instead of waiting for all 153 pages
+  // (~9 minutes) before the first one is added.
+  let runPace = 1, runInjectFails = 0, runAdded = 0;
+  const runUnconfirmed = [], runFailed = [];
+  function resetRunStats() {
+    runPace = 1; runInjectFails = 0; runAdded = 0;
+    runUnconfirmed.length = 0; runFailed.length = 0;
+  }
+  // -> "done" | "stopped" | "no-tab" | "lost-tab"
+  async function drainQueue() {
+    if (nextIndex >= masterList.length) return "done";
+    log(`\n\u25b6 Adding ${masterList.length - nextIndex} URL(s) (from #${nextIndex + 1}).\n`);
+    let i = nextIndex;
+    for (; i < masterList.length; i++) {
+      if (stopRequested) {
+        nextIndex = i; persistQueueState();
+        log(`\n\u25a0 Stopped at ${i}/${masterList.length}. Click "Add to LazyApply Queue" to resume from #${i + 1}.`);
+        return "stopped";
+      }
+      const url = masterList[i];
+      setProgress(i / masterList.length);
+      // Re-find the tab every iteration so a closed/re-opened LazyApply tab is
+      // picked up instead of killing the run.
+      const tab = await findLazyApplyTab();
+      if (!tab) {
+        nextIndex = i; persistQueueState();
+        log(`\n\u25a0 LazyApply tab not found \u2014 paused at ${i}/${masterList.length}. Open https://app.lazyapply.com/dashboard (Job Queue) and click "Add to LazyApply Queue" to resume from #${i + 1}.`);
+        return "no-tab";
+      }
+      try {
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id }, func: addUrlToQueueInPage, args: [url],
+        });
+        const r = res && res.result;
+        if (r && r.ok) {
+          runInjectFails = 0;
+          if (r.confirmed) {
+            runAdded++;
+            runPace = Math.max(1, runPace - 5);
+            log(`Adding ${i + 1}/${masterList.length} \u2713  ${url}`);
+          } else {
+            // Not proven queued. Do NOT retry: the request may still land and a
+            // retry would queue the job twice. Slow down, record it, move on.
+            runPace = Math.min(2000, runPace * 2 + 200);
+            runUnconfirmed.push(url);
+            log(`Adding ${i + 1}/${masterList.length} \u26a0 unconfirmed  ${url}`);
+          }
+        } else {
+          runInjectFails = 0;
+          runFailed.push({ url, error: (r && r.error) || "unknown" });
+          log(`Adding ${i + 1}/${masterList.length} \u2717  ${url}  \u2014 ${(r && r.error) || "failed"}`);
+        }
+      } catch (e) {
+        // Crashed/reloading tab: retry this same URL, then pause with the
+        // resume point saved rather than burning through the rest of the list.
+        runInjectFails += 1;
+        if (runInjectFails >= 4) {
+          nextIndex = i; persistQueueState();
+          log(`\n\u25a0 Lost the LazyApply tab at ${i}/${masterList.length} (${e?.message || e}).`);
+          log(`  Reload https://app.lazyapply.com/dashboard, then click "Add to LazyApply Queue" to resume from #${i + 1}.`);
+          return "lost-tab";
+        }
+        log(`\u26a0 Page busy, retrying ${i + 1}/${masterList.length}\u2026 (${runInjectFails}/3)`);
+        await sleep(600 * runInjectFails);
+        i -= 1;
+        continue;
+      }
+      nextIndex = i + 1;
+      persistQueueState();
+      await sleep(runPace);
+    }
+    return "done";
   }
 
   async function runQueue() {
@@ -678,7 +762,9 @@
       els.startBtn.disabled = false;
     };
 
-    // Search pages first: they are turned into job URLs, then queued below.
+    resetRunStats();
+
+    // Search pages first: each page's job links are queued as soon as it is read.
     if (searchesLeft) {
       let ok = false;
       try { ok = await expandSearches(); }
@@ -695,76 +781,7 @@
       }
     }
 
-    let pace = 1;        // ms between adds; adapts upward if the page struggles
-    let injectFails = 0; // consecutive executeScript failures (crashed/reloading tab)
-    const unconfirmed = [];   // added-but-not-proven, reported at the end
-    let added = 0;
-    const failed = [];
-    const startAt = nextIndex;
-    log(`\n▶ Adding ${masterList.length - startAt} URL(s) (from #${startAt + 1}).\n`);
-
-    let i = startAt;
-    for (; i < masterList.length; i++) {
-      if (stopRequested) { nextIndex = i; persistQueueState(); log(`\n■ Stopped at ${i}/${masterList.length}. Click "Add to LazyApply Queue" to resume from #${i + 1}.`); break; }
-      const url = masterList[i];
-      setProgress(i / masterList.length);
-      // Re-find the tab every iteration so a closed/re-opened LazyApply tab (a
-      // common cause of the run halting) is picked up instead of killing the run.
-      const tab = await findLazyApplyTab();
-      if (!tab) {
-        nextIndex = i; persistQueueState();
-        log(`\n■ LazyApply tab not found — paused at ${i}/${masterList.length}. Open https://app.lazyapply.com/dashboard (Job Queue) and click "Add to LazyApply Queue" to resume from #${i + 1}.`);
-        break;
-      }
-      try {
-        const [res] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: addUrlToQueueInPage,
-          args: [url],
-        });
-        const r = res && res.result;
-        if (r && r.ok) {
-          injectFails = 0;
-          if (r.confirmed) {
-            added++;
-            pace = Math.max(1, pace - 5);
-            log(`Adding ${i + 1}/${masterList.length} ✓  ${url}`);
-          } else {
-            // NOT proven queued within 30 s. Do NOT retry: the request may
-            // still land, and a retry would queue the job twice. Slow down,
-            // record it, and move on.
-            pace = Math.min(2000, pace * 2 + 200);
-            unconfirmed.push(url);
-            log(`Adding ${i + 1}/${masterList.length} ⚠ unconfirmed  ${url}`);
-          }
-        } else {
-          injectFails = 0;
-          failed.push({ url, error: (r && r.error) || "unknown" });
-          log(`Adding ${i + 1}/${masterList.length} ✗  ${url}  — ${(r && r.error) || "failed"}`);
-        }
-      } catch (e) {
-        // The tab crashed or is reloading. Previously this just marked the URL
-        // failed and moved on, so a crash silently burned through the whole
-        // remaining list — which is why it "stopped before adding all". Now we
-        // retry, then PAUSE with the resume point saved.
-        injectFails += 1;
-        if (injectFails >= 4) {
-          nextIndex = i; persistQueueState();
-          log(`\n■ Lost the LazyApply tab at ${i}/${masterList.length} (${e?.message || e}).`);
-          log(`  Reload https://app.lazyapply.com/dashboard, then click "Add to LazyApply Queue" to resume from #${i + 1}.`);
-          break;
-        }
-        log(`⚠ Page busy, retrying ${i + 1}/${masterList.length}… (${injectFails}/3)`);
-        await sleep(600 * injectFails);
-        i -= 1;          // retry this same URL
-        continue;
-      }
-      // Advance the resume pointer AFTER each URL is processed and persist it, so
-      // a mid-run teardown resumes here instead of restarting from the top.
-      nextIndex = i + 1;
-      persistQueueState();
-      await sleep(pace);
-    }
+    await drainQueue();
 
     endRun();
 
@@ -772,17 +789,17 @@
       // Whole list finished — clear saved progress so the next upload starts clean.
       setProgress(1);
       clearQueueState();
-      log(`\n✔ Done. Confirmed added: ${added}.  Unconfirmed: ${unconfirmed.length}.  Failed: ${failed.length}.`);
-      if (unconfirmed.length) {
+      log(`\n✔ Done. Confirmed added: ${runAdded}.  Unconfirmed: ${runUnconfirmed.length}.  Failed: ${runFailed.length}.`);
+      if (runUnconfirmed.length) {
         log("Unconfirmed (LazyApply never cleared the field — check the queue for these):");
-        unconfirmed.forEach((u) => log(`  • ${u}`));
+        runUnconfirmed.forEach((u) => log(`  • ${u}`));
       }
     } else {
       setProgress(nextIndex / masterList.length);
     }
-    if (failed.length) {
+    if (runFailed.length) {
       log("Failed URLs:");
-      failed.forEach((f) => log(`  • ${f.url}  (${f.error})`));
+      runFailed.forEach((f) => log(`  • ${f.url}  (${f.error})`));
     }
   }
 
