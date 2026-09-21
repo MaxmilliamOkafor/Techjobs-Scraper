@@ -113,9 +113,14 @@ console.log('\nAND IT SAYS WHAT IT TURNED AWAY, NOT ONLY HOW MANY IT KEPT');
   const r = M.scanCsv(searches);
   t('  nothing supported', r.urls.length === 0, JSON.stringify(r.urls));
   t('  ...but the rows were read', r.rows === 3, String(r.rows));
-  t('  ...and counted as rejected', r.rejected === 3, String(r.rejected));
-  t('  ...and named, commonest first',
-    r.hosts[0][0] === 'google.com' && r.hosts[0][1] === 2, JSON.stringify(r.hosts));
+  // Search pages are no longer a rejection: they are COLLECTED, to be opened
+  // and mined for the job links they list. So they are counted as searches,
+  // and neither inflate `rejected` nor appear in the turned-away host list.
+  t('  ...and collected as searches, not rejections', r.searches.length === 3,
+    JSON.stringify(r.searches));
+  t('  ...so nothing is counted as rejected', r.rejected === 0, String(r.rejected));
+  t('  ...and the turned-away host list stays empty',
+    Array.isArray(r.hosts) && r.hosts.length === 0, JSON.stringify(r.hosts));
 
   // The three cases the old message could not distinguish.
   const empty = M.scanCsv('');
@@ -133,8 +138,10 @@ console.log('\nAND THE SUMMARY ACTUALLY USES ANY OF THAT');
 {
   t('  the per-file line reports skipped', /\$\{p\.rejected\} skipped/.test(src),
     'the count is collected and never shown');
-  t('  the search-page case is named outright', /SEARCH pages, not job postings/.test(src),
-    'the commonest cause of 0 would go unexplained');
+  // Search pages are an accepted input now, not a cause of zero: the summary
+  // has to say they were found and will be opened for the links they list.
+  t('  the search-page case is named outright', /search page\(s\)/.test(src),
+    'search pages would be collected with nothing said about them');
   t('  the platforms it drives are listed', /Greenhouse, Lever, Ashby, Rippling/.test(src),
     'no way to know what it wanted instead');
   t('  the no-rows case is separate', /no readable rows/.test(src), 'a parse failure reads as 0 supported');
@@ -159,15 +166,16 @@ console.log('\nAND PRESSING THE BUTTON ALWAYS PRODUCES AN ANSWER');
     !/startBtn\.disabled = master(List)?\.length === 0/.test(src),
     'a dead button is the whole symptom');
 
-  // Far enough in to reach the "Adding N URL(s)" announcement, which is
-  // the line the tab check has to come before.
-  const head = src.slice(src.indexOf('async function runQueue'),
-    src.indexOf('async function runQueue') + 2200);
+  // The whole of runQueue, not a fixed-length window: the function grew when
+  // search-page handling landed and a 2200-char slice stopped reaching the
+  // "Adding N URL(s)" announcement, so the ordering check silently compared
+  // against -1 and failed on correct code.
+  const head = src.slice(src.indexOf('async function runQueue'));
   t('  an empty list is explained, not swallowed',
     /Nothing loaded to add/.test(head) && !/if \(running \|\| !masterList\.length\) return;/.test(src),
     'the silent return is still there');
   t('  ...and it names what the file should have held',
-    /Greenhouse,/.test(head) && /search URLs will not do it/.test(head),
+    /Greenhouse, Lever, Ashby or/.test(head) && /search pages that list them/.test(head),
     'no way to know what was wrong with the file');
   t('  a missing LazyApply tab is caught before the run is announced',
     head.indexOf('No LazyApply tab is open') < head.indexOf('▶ Adding'),

@@ -40,6 +40,78 @@
     return !!h && ATS_HOSTS.some((re) => re.test(h));
   }
 
+  // ---- Universal URL handling -------------------------------------------
+  // A CSV can reach this tool in many shapes: a "Job URL" column, a "url"
+  // column, several URL columns, redirect/tracking wrappers, or no job URLs
+  // at all but SEARCH pages that list them (a Boolean Google search with
+  // site:greenhouse.io etc.). All of these are accepted now.
+
+  // Search-engine result pages. These are not jobs, but the jobs are on them:
+  // they are opened in a background tab and their job links collected.
+  const SEARCH_HOST_RE = /^(?:google\.[a-z.]+|bing\.com|duckduckgo\.com|html\.duckduckgo\.com)$/i;
+  function isSearchUrl(url) {
+    const h = hostOf(url);
+    if (!h || !SEARCH_HOST_RE.test(h)) return false;
+    try {
+      const u = new URL(url);
+      return /^\/(search|html\/?)?$/i.test(u.pathname) && (u.searchParams.has("q") || u.searchParams.has("p"));
+    } catch (_) { return false; }
+  }
+
+  // Redirectors (google.com/url?q=…, trackers with ?url= / ?to= …) carry the
+  // real link in a query parameter. Only a value that is ITSELF a supported
+  // URL is taken, so a search's "site:greenhouse.io" text never qualifies.
+  function unwrap(url) {
+    if (isSupported(url)) return url;
+    try {
+      const u = new URL(url);
+      for (const [, v] of u.searchParams) {
+        if (/^https?:\/\//i.test(v) && isSupported(v)) return v;
+      }
+    } catch (_) {}
+    return url;
+  }
+
+  // One canonical form per posting, so the same job reached via http://,
+  // a tracking suffix or a trailing slash is only queued once.
+  const TRACKING_PARAM_RE = /^(utm_.*|gh_src|lever-source.*|lever-origin|ref|src|source|referrer|fbclid|gclid)$/i;
+  function normalizeJobUrl(url) {
+    try {
+      const u = new URL(url);
+      u.protocol = "https:";
+      u.hash = "";
+      for (const k of Array.from(u.searchParams.keys())) {
+        if (TRACKING_PARAM_RE.test(k)) u.searchParams.delete(k);
+      }
+      // gh_jid only repeats the id when the path already names the job.
+      if (/\/jobs\/\d+/.test(u.pathname)) u.searchParams.delete("gh_jid");
+      let out = u.toString();
+      if (out.endsWith("?")) out = out.slice(0, -1);
+      return out.replace(/\/(?=$)/, "");
+    } catch (_) { return url; }
+  }
+
+  // A board's HOME page (jobs.lever.co/acme) is on a supported host but is not
+  // a posting; LazyApply cannot apply to it. Search results are full of them.
+  function isJobPosting(url) {
+    if (!isSupported(url)) return false;
+    try {
+      const u = new URL(url);
+      const h = u.hostname.replace(/^www\./, "");
+      const segs = u.pathname.split("/").filter(Boolean);
+      if (/greenhouse\.io$/i.test(h)) return /\/jobs\/\d+/.test(u.pathname) || u.searchParams.has("token") || u.searchParams.has("gh_jid");
+      if (/lever\.co$/i.test(h) || /ashbyhq\.com$/i.test(h)) return segs.length >= 2;
+      return /\/jobs?\/[^/]+/.test(u.pathname) || segs.length >= 2;
+    } catch (_) { return false; }
+  }
+
+  // Every URL inside a cell, not just the first: some exports put several
+  // links in one cell, separated by spaces, pipes or semicolons.
+  function urlsIn(cell) {
+    return (String(cell || "").match(/https?:\/\/[^\s",|;<>]+/gi) || [])
+      .map((u) => u.replace(/[)\].,;]+$/, ""));
+  }
+
   const els = {
     card: document.getElementById("csv-card"),
     dropzone: document.getElementById("csv-dropzone"),
@@ -55,6 +127,9 @@
 
   let masterList = []; // deduped, supported URLs across all files
   let nextIndex = 0;   // resume pointer: index of the first URL not yet processed
+  let searchList = []; // search-result pages still to be opened for job links
+  let searchIndex = 0; // resume pointer into searchList
+  let sourceSig = "";  // identifies the uploaded file(s), for resuming
   let running = false;
   let stopRequested = false;
 
@@ -68,7 +143,7 @@
   function persistQueueState() {
     try {
       chrome.storage.local.set({
-        [LA_STATE_KEY]: { sig: listSignature(masterList), master: masterList, nextIndex }
+        [LA_STATE_KEY]: { sig: sourceSig, master: masterList, nextIndex, searches: searchList, searchIndex }
       });
     } catch (_) {}
   }
@@ -121,37 +196,45 @@
     );
   }
 
-  // Returns the supported URLs AND what it turned away.
+  // Returns the job URLs, the SEARCH pages to expand, and what it turned away.
   //
-  // "0 supported" on its own is a dead end: it looks identical whether
-  // the file failed to parse, held no URLs at all, or held four hundred
-  // perfectly good URLs from a platform this tool does not drive. Those
-  // need three different answers, so the count is reported alongside the
-  // hosts that produced it.
+  // Every cell of every row is scanned, whatever the columns are called, so
+  // the tool no longer depends on the file having a "Job URL" column. A
+  // "0 supported" still says WHY: the hosts it skipped are reported.
   function scanCsv(text) {
     const rows = parseCsv(text).filter((r) => r.some((c) => c && c.trim()));
-    if (!rows.length) return { urls: [], rejected: 0, hosts: [], rows: 0, column: -1 };
+    if (!rows.length) return { urls: [], searches: [], rejected: 0, hosts: [], rows: 0, column: -1 };
     const col = findUrlColumn(rows[0]);
-    const out = [];
+    // A header row is one that holds no URL of its own.
+    const hasHeader = !rows[0].some((c) => urlsIn(c).length);
+    const out = [], searches = [];
+    const seen = new Set(), seenSearch = new Set();
     const seenHosts = new Map();
     let rejected = 0;
-    const start = col === -1 ? 0 : 1; // no header match → scan every row/cell
-    for (let r = start; r < rows.length; r++) {
-      const cells = col === -1 ? rows[r] : [rows[r][col]];
+    for (let r = hasHeader ? 1 : 0; r < rows.length; r++) {
+      // The URL column first, so its link wins the dedupe, then the rest.
+      const cells = col === -1 ? rows[r] : [rows[r][col], ...rows[r].filter((_, i) => i !== col)];
       for (const cell of cells) {
-        if (!cell) continue;
-        const m = String(cell).match(/https?:\/\/[^\s",]+/);
-        let url = (m ? m[0] : String(cell).trim()).replace(/[)\].,;]+$/, "");
-        if (!url) continue;
-        if (isSupported(url)) { out.push(url); continue; }
-        if (!/^https?:\/\//i.test(url)) continue;  // not a URL at all, not a rejection
-        rejected++;
-        const h = hostOf(url) || "?";
-        seenHosts.set(h, (seenHosts.get(h) || 0) + 1);
+        for (const raw of urlsIn(cell)) {
+          const url = unwrap(raw);
+          if (isSupported(url)) {
+            if (!isJobPosting(url)) continue;          // a board home page, not a job
+            const n = normalizeJobUrl(url);
+            if (!seen.has(n)) { seen.add(n); out.push(n); }
+            continue;
+          }
+          if (isSearchUrl(url)) {
+            if (!seenSearch.has(url)) { seenSearch.add(url); searches.push(url); }
+            continue;
+          }
+          rejected++;
+          const h = hostOf(url) || "?";
+          seenHosts.set(h, (seenHosts.get(h) || 0) + 1);
+        }
       }
     }
     const hosts = [...seenHosts.entries()].sort((a, b) => b[1] - a[1]);
-    return { urls: out, rejected, hosts, rows: rows.length - (col === -1 ? 0 : 1), column: col };
+    return { urls: out, searches, rejected, hosts, rows: rows.length - (hasHeader ? 1 : 0), column: col };
   }
 
   function extractUrls(text) { return scanCsv(text).urls; }
@@ -159,63 +242,73 @@
   async function readFiles(fileList) {
     const files = Array.from(fileList);
     const perFile = [];
-    const seen = new Set();
-    const master = [];
+    const seen = new Set(), seenSearch = new Set();
+    const master = [], searches = [];
     for (const f of files) {
-      let scan = { urls: [], rejected: 0, hosts: [], rows: 0 };
+      let scan = { urls: [], searches: [], rejected: 0, hosts: [], rows: 0 };
       try { scan = scanCsv(await f.text()); }
       catch (e) { log(`⚠ Could not read ${f.name}: ${e?.message || e}`); }
-      perFile.push({ name: f.name, count: scan.urls.length,
+      perFile.push({ name: f.name, count: scan.urls.length, searches: scan.searches.length,
         rejected: scan.rejected, hosts: scan.hosts, rows: scan.rows });
       for (const u of scan.urls) if (!seen.has(u)) { seen.add(u); master.push(u); }
+      for (const u of scan.searches) if (!seenSearch.has(u)) { seenSearch.add(u); searches.push(u); }
     }
-    return { perFile, master };
+    return { perFile, master, searches };
   }
 
   async function handleFiles(fileList) {
     if (!fileList || !fileList.length || running) return;
     clearLog();
     setProgress(0);
-    const { perFile, master } = await readFiles(fileList);
+    const { perFile, master, searches } = await readFiles(fileList);
     masterList = master;
-    // If this is the SAME list a previous (interrupted) run was working through,
-    // resume from where it stopped rather than re-adding everything.
+    searchList = searches;
+    sourceSig = listSignature(master) + "#" + listSignature(searches);
+    // If this is the SAME file a previous (interrupted) run was working through,
+    // resume from where it stopped rather than re-adding everything. Job links
+    // already collected from search pages come back with it.
     let resumed = 0;
+    nextIndex = 0; searchIndex = 0;
     try {
       const stored = await chrome.storage.local.get(LA_STATE_KEY);
       const s = stored[LA_STATE_KEY];
-      if (s && s.sig === listSignature(master) && Number.isFinite(s.nextIndex)) {
-        nextIndex = Math.min(Math.max(0, s.nextIndex), master.length);
+      if (s && s.sig === sourceSig && Array.isArray(s.master)) {
+        masterList = s.master;
+        nextIndex = Math.min(Math.max(0, s.nextIndex || 0), masterList.length);
+        searchIndex = Math.min(Math.max(0, s.searchIndex || 0), searchList.length);
         resumed = nextIndex;
-      } else {
-        nextIndex = 0;
       }
-    } catch (_) { nextIndex = 0; }
+    } catch (_) {}
     persistQueueState();
     const totalRaw = perFile.reduce((a, b) => a + b.count, 0);
     const lines = perFile.map((p) => {
-      let line = `  • ${p.name}: ${p.count} supported`;
+      let line = `  • ${p.name}: ${p.count} job URL(s)`;
+      if (p.searches) line += `, ${p.searches} search page(s)`;
       if (p.rejected) line += `, ${p.rejected} skipped`;
-      if (!p.count && !p.rejected && !p.rows) line += " (no rows read)";
+      if (!p.count && !p.searches && !p.rejected && !p.rows) line += " (no rows read)";
       return line;
     });
+    const pendingSearches = searchList.length - searchIndex;
     els.summary.textContent =
       `${perFile.length} file(s) scanned\n${lines.join("\n")}` +
-      `\n\nSupported (pre-dedupe): ${totalRaw}\nUnique to add: ${master.length}` +
+      `\n\nJob URLs (pre-dedupe): ${totalRaw}\nUnique to add: ${masterList.length}` +
+      (searchList.length ? `\nSearch pages to open: ${pendingSearches}${searchIndex ? ` (${searchIndex} done)` : ""}` : "") +
       (resumed > 0 ? `\nAlready added: ${resumed} — will resume from #${resumed + 1}` : "");
     els.startBtn.disabled = false;   // stays live; runQueue says what is missing
-    setProgress(master.length ? nextIndex / master.length : 0);
-    log(
-      master.length
-        ? (resumed > 0
-            ? `Loaded ${master.length} URL(s). ${resumed} already added — click "Add to LazyApply Queue" to resume from #${resumed + 1}.`
-            : `Loaded ${master.length} unique supported URL(s). Open the LazyApply Job Queue, then click "Add to LazyApply Queue".`)
-        : ""   // the specific reason is logged just below; this said nothing
-    );
+    setProgress(masterList.length ? nextIndex / masterList.length : 0);
+    if (masterList.length || searchList.length) {
+      if (resumed > 0) log(`Loaded ${masterList.length} URL(s). ${resumed} already added — click "Add to LazyApply Queue" to resume from #${resumed + 1}.`);
+      else if (masterList.length) log(`Loaded ${masterList.length} unique job URL(s).`);
+      if (pendingSearches) {
+        log(`Found ${pendingSearches} search page(s). Each is opened in a background tab and its`);
+        log("Greenhouse / Lever / Ashby / Rippling job links are collected, then queued.");
+      }
+      log('Open the LazyApply Job Queue, then click "Add to LazyApply Queue".');
+    }
 
-    // Say WHY nothing came through. The three reasons need three
-    // different fixes and the count alone distinguishes none of them.
-    if (!master.length) {
+    // Say WHY nothing came through. The reasons need different fixes and
+    // the count alone distinguishes none of them.
+    if (!masterList.length && !searchList.length) {
       const allHosts = new Map();
       let anyRows = 0;
       for (const p of perFile) {
@@ -223,21 +316,120 @@
         for (const [h, n] of p.hosts || []) allHosts.set(h, (allHosts.get(h) || 0) + n);
       }
       if (!anyRows) {
-        log("The file had no readable rows. Check it is a CSV with a header row.");
+        log("The file had no readable rows. Check it is a CSV (or a plain list of URLs).");
       } else if (!allHosts.size) {
-        log(`Read ${anyRows} row(s) but found no URLs in them. The column holding the`);
-        log('links should be named "Job URL" or "url".');
+        log(`Read ${anyRows} row(s) but found no URLs in any column.`);
       } else {
         const top = [...allHosts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
-        log(`Read ${anyRows} row(s) and found URLs, but none on a platform this tool drives.`);
+        log(`Read ${anyRows} row(s) and found URLs, but none on a platform LazyApply queues.`);
         log("What was in the file: " + top.map(([h, n]) => `${h} (${n})`).join(", "));
         log("It queues job postings on: Greenhouse, Lever, Ashby, Rippling.");
-        if (top.some(([h]) => /google\.|bing\.|duckduckgo\./i.test(h))) {
-          log("Those are SEARCH pages, not job postings. Export the job URLs themselves");
-          log("rather than the searches that find them.");
-        }
       }
     }
+  }
+
+  // ---- Search-page expansion (runs in a background tab) ------------------
+  // Injected into a search results page. Pure function: no closure.
+  function readSearchPage() {
+    const text = (document.body && document.body.innerText) || "";
+    const captcha = /\/sorry\//.test(location.pathname) ||
+      !!document.querySelector('form#captcha-form, iframe[src*="recaptcha"], #recaptcha') ||
+      /unusual traffic|not a robot|verify you are human/i.test(text.slice(0, 3000));
+    const consent = /consent\./.test(location.hostname);
+    const hrefs = Array.from(document.querySelectorAll("a[href]")).map((a) => a.href);
+    return { captcha, consent, hrefs, url: location.href };
+  }
+
+  function waitTabComplete(tabId, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (ok) => {
+        if (done) return; done = true;
+        try { chrome.tabs.onUpdated.removeListener(onUpd); } catch (_) {}
+        clearTimeout(t); resolve(ok);
+      };
+      const onUpd = (id, info) => { if (id === tabId && info.status === "complete") finish(true); };
+      chrome.tabs.onUpdated.addListener(onUpd);
+      const t = setTimeout(() => finish(false), timeoutMs);
+      chrome.tabs.get(tabId).then((tab) => { if (tab && tab.status === "complete") setTimeout(() => finish(true), 50); }).catch(() => finish(false));
+    });
+  }
+
+  async function readTab(tabId) {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: readSearchPage });
+    return (res && res.result) || { captcha: false, hrefs: [] };
+  }
+
+  // Opens each search page in ONE reused background tab, collects its job
+  // links and appends them to masterList. Paced to look like a person paging
+  // through results. If the search engine asks for a human check, the tab is
+  // brought to the front and the run waits for YOU to complete it; it is never
+  // bypassed. Returns false if the run was stopped.
+  async function expandSearches() {
+    if (searchIndex >= searchList.length) return true;
+    const seen = new Set(masterList);
+    let tab = null;
+    let found = 0;
+    log(`\n🔎 Opening ${searchList.length - searchIndex} search page(s) to collect job links…\n`);
+    try {
+      tab = await chrome.tabs.create({ url: "about:blank", active: false });
+      for (; searchIndex < searchList.length; searchIndex++) {
+        if (stopRequested) { persistQueueState(); log(`\n■ Stopped while reading search pages (${searchIndex}/${searchList.length}).`); return false; }
+        const url = searchList[searchIndex];
+        setProgress(searchIndex / searchList.length);
+        try { await chrome.tabs.update(tab.id, { url }); }
+        catch (_) { tab = await chrome.tabs.create({ url, active: false }); }
+        await waitTabComplete(tab.id, 20000);
+        await sleep(800);                              // let results render
+
+        let page = await readTab(tab.id).catch(() => ({ captcha: false, hrefs: [] }));
+        if (page.captcha || page.consent) {
+          log(`⚠ The search engine is asking for a check (page ${searchIndex + 1}). Complete it in the`);
+          log("  tab that just opened; collection continues by itself once it's done.");
+          try {
+            await chrome.tabs.update(tab.id, { active: true });
+            const t = await chrome.tabs.get(tab.id);
+            await chrome.windows.update(t.windowId, { focused: true });
+          } catch (_) {}
+          const deadline = Date.now() + 10 * 60 * 1000;
+          for (;;) {
+            if (stopRequested) { persistQueueState(); log("\n■ Stopped."); return false; }
+            if (Date.now() > deadline) { persistQueueState(); log(`\n■ Check not completed in 10 min — paused at search page ${searchIndex + 1}. Click "Add to LazyApply Queue" to resume.`); return false; }
+            await sleep(2000);
+            page = await readTab(tab.id).catch(() => ({ captcha: true, hrefs: [] }));
+            if (!page.captcha && !page.consent) break;
+          }
+          // Back on the results (the engine usually returns there itself).
+          if (!isSearchUrl(page.url)) {
+            await chrome.tabs.update(tab.id, { url });
+            await waitTabComplete(tab.id, 20000);
+            await sleep(800);
+            page = await readTab(tab.id).catch(() => ({ captcha: false, hrefs: [] }));
+          }
+          log("✓ Thanks — continuing.");
+        }
+
+        let here = 0;
+        for (const raw of page.hrefs || []) {
+          const u = unwrap(raw);
+          if (!isJobPosting(u)) continue;
+          const n = normalizeJobUrl(u);
+          if (seen.has(n)) continue;
+          seen.add(n); masterList.push(n); here++;
+        }
+        found += here;
+        log(`Search ${searchIndex + 1}/${searchList.length}: ${here} new job link(s)`);
+        persistQueueState();
+        // Human-ish pacing between result pages keeps the engine from
+        // challenging every request.
+        await sleep(2500 + Math.round(Math.random() * 2500));
+      }
+    } finally {
+      if (tab) chrome.tabs.remove(tab.id).catch(() => {});
+    }
+    persistQueueState();
+    log(`\n✔ Search pages done — ${found} job link(s) collected. Total to add: ${masterList.length}.`);
+    return true;
   }
 
   // ---- Page automation (runs in the LazyApply tab) -----------------------
@@ -249,52 +441,103 @@
   async function addUrlToQueueInPage(url) {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+    // Identify the queue URL field POSITIVELY, or not at all.
+    //
+    // The old last resort was "first visible input", and it allowed
+    // type="search" — so whenever the two placeholder selectors missed (the
+    // Add-Job card not mounted yet, or a placeholder reworded), every job URL
+    // was typed into whatever box happened to be first in the DOM: the site's
+    // search bar. The page also now carries a "Job Title (Optional)" field, so
+    // there is more than one wrong answer available. Typing a job URL into an
+    // arbitrary box is worse than doing nothing, so this returns null instead.
     function findInput() {
-      // The placeholder is the only stable, unique anchor (ids like ":r7:" and
-      // css-hash classes are regenerated on every render/build).
-      return (
-        document.querySelector('input[placeholder^="https://company.greenhouse.io/jobs"]') ||
-        document.querySelector('input[placeholder*="greenhouse.io/jobs"]') ||
-        (function () {
-          const inputs = Array.from(document.querySelectorAll("input, textarea"));
-          return (
-            inputs.find((i) =>
-              /greenhouse|lever|ashby|rippling|job.*queue|queue|paste|job url|job posting/i.test(
-                (i.getAttribute("placeholder") || "") + " " + (i.getAttribute("aria-label") || "")
-              )
-            ) ||
-            inputs.find((i) => {
-              if (i.type && !/^(text|url|search|)$/i.test(i.type)) return false;
-              const r = i.getBoundingClientRect();
-              return r.width > 0 && r.height > 0;
-            }) ||
-            null
-          );
-        })()
-      );
+      const vis = (i) => { const r = i.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const isWrongField = (i) => {
+        if (!i) return true;
+        if (i.type && /^(search|password|email|number|checkbox|radio|hidden|file|submit|button)$/i.test(i.type)) return true;
+        const ph = i.getAttribute("placeholder") || "";
+        if (/^https?:\/\//i.test(ph)) return false;   // a URL example = strong positive
+        const hay = [ph, i.getAttribute("aria-label"), i.getAttribute("name"), i.id].filter(Boolean).join(" ");
+        return /search|filter|title|keyword|location|email|password/i.test(hay);
+      };
+
+      // 1) The documented placeholder.
+      let el = document.querySelector('input[placeholder^="https://company.greenhouse.io/jobs"]')
+            || document.querySelector('input[placeholder*="greenhouse.io/jobs"]');
+      if (el && vis(el)) return el;
+
+      // 2) Any field whose placeholder is itself a URL example.
+      el = Array.from(document.querySelectorAll("input")).find(
+        (i) => /^https?:\/\//i.test(i.getAttribute("placeholder") || "") && vis(i));
+      if (el) return el;
+
+      // 3) Scope to the "Add Job to Queue" card, skipping Job Title.
+      const label = Array.from(document.querySelectorAll("h1,h2,h3,h4,h5,h6,div,span,p"))
+        .find((n) => n.children.length === 0 && /add job to queue/i.test((n.textContent || "").trim()));
+      const card = label && label.closest("section, form, div");
+      if (card) {
+        el = Array.from(card.querySelectorAll("input")).find((i) => !isWrongField(i) && vis(i));
+        if (el) return el;
+      }
+
+      // 4) A field named for one of the platforms — still never a search box.
+      el = Array.from(document.querySelectorAll("input, textarea")).find((i) =>
+        /greenhouse|lever|ashby|rippling|job url|job posting|paste/i.test(
+          (i.getAttribute("placeholder") || "") + " " + (i.getAttribute("aria-label") || "")
+        ) && !isWrongField(i) && vis(i));
+      if (el) return el;
+
+      return null;   // deliberately no "first visible input" fallback
     }
+
     function findAddButton(input) {
-      const btns = Array.from(
-        document.querySelectorAll('button, [role="button"], input[type="submit"]')
-      );
-      let b = btns.find((x) => /add to queue/i.test((x.textContent || "").trim()));
+      const vis = (b) => b && b.offsetParent !== null;
+      const txt = (b) => ((b.textContent || b.value || "")).replace(/\s+/g, " ").trim();
+      const btns = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+      let b = btns.find((x) => /add to queue/i.test(txt(x)));
       if (b) return b;
-      b = btns.find((x) => /add job|add url|^\s*\+?\s*add\s*$/i.test((x.textContent || x.value || "").trim()));
+      b = btns.find((x) => /^\+?\s*add\b/i.test(txt(x)) && !/remove|delete|clear/i.test(txt(x)));
       if (b) return b;
+      // Scoped, but ONLY an add-ish control. "First visible button" in the
+      // container could be a nav or search control.
       if (input) {
-        const scope = input.closest("form, div");
+        const scope = input.closest("form, section, div");
         if (scope) {
-          b = Array.from(scope.querySelectorAll('button, [role="button"]')).find(
-            (x) => x.offsetParent !== null
-          );
+          b = Array.from(scope.querySelectorAll('button, [role="button"]'))
+            .find((x) => vis(x) && /add|queue|submit/i.test(txt(x)));
           if (b) return b;
         }
       }
       return null;
     }
 
-    const input = findInput();
-    if (!input) return { ok: false, error: "URL input field not found" };
+    // The page is BUSY while a previous add is still in flight: the field and
+    // the button are disabled and the button reads "Adding...". Writing a new
+    // URL into a disabled field does nothing, and the old code then fell
+    // through to an Enter-key fallback the page never listens for. Wait it out.
+    const isBusy = () => {
+      const i = findInput();
+      const b = findAddButton(i);
+      return !!(i && i.disabled) || !!(b && /^\s*adding\b/i.test(b.textContent || ""));
+    };
+    {
+      const idleDeadline = Date.now() + 30000;
+      let w = 50;
+      while (isBusy()) {
+        if (Date.now() >= idleDeadline) return { ok: false, busy: true, error: "page still busy with the previous add" };
+        await sleep(w);
+        if (w < 300) w = Math.min(300, Math.round(w * 1.5));
+      }
+    }
+
+    // The Add-Job card can mount a moment after navigation. Wait briefly rather
+    // than declaring it missing (which previously sent us to a fallback that
+    // typed into the site's search bar).
+    let input = findInput();
+    for (let w = 0; !input && w < 20; w++) { await sleep(100); input = findInput(); }
+    if (!input) {
+      return { ok: false, error: 'queue URL field not found — open the LazyApply "Add Job to Queue" page' };
+    }
 
     const proto =
       input.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
@@ -329,6 +572,7 @@
     if (!btn) {
       // No button at all — fall back to submitting with Enter.
       input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
+      input.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", keyCode: 13, charCode: 13, which: 13, bubbles: true }));
       input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
       return { ok: true, via: "enter", confirmed: false };
     }
@@ -342,30 +586,48 @@
       return { ok: false, error: "input did not hold the URL at click time" };
     }
 
+    // Snapshot the alerts already on screen so an old "success" toast is
+    // never mistaken for this add's result.
+    const alertTexts = () =>
+      Array.from(document.querySelectorAll('.MuiAlert-message, [role="alert"]'))
+        .map((a) => (a.innerText || a.textContent || "").trim()).filter(Boolean);
+    const before = new Set(alertTexts());
+
     btn.click();
 
-    // Confirmation. LazyApply consumes a URL by CLEARING the field, and that
-    // clear is the ONLY unambiguous proof the job was queued.
+    // Confirmation. LazyApply clears the field ONLY after its POST succeeds;
+    // on failure it leaves the URL in place and shows an error toast.
     //
-    // btn.disabled must NOT be used as the success signal: the button is
-    // disabled whenever the field is empty, so it is also the button's resting
-    // state, and it can read disabled transiently in the moment after a click.
-    // Checking it first, before any settle, reported "added" for URLs that were
-    // never queued — the log showed a tick for every row while the queue
-    // received far fewer jobs.
-    let confirmed = false;
-    const confDeadline = Date.now() + 2500;
-    let civ = 10;
-    await sleep(civ);                 // let React process the click before looking
+    // That POST now takes ~2-3 s (it used to be well under one), which is
+    // what broke this: the old 2.5 s window expired while the request was
+    // still in flight, the URL was marked "unconfirmed" and retried into a
+    // page that was still "Adding...", and the retry fell through to a
+    // fallback that queued nothing. So wait for the request to FINISH (the
+    // page leaves its busy state), then read the outcome.
+    const clickedAt = Date.now();
+    const confDeadline = clickedAt + 30000;
+    let civ = 50, sawBusy = false;
+    await sleep(civ);                 // let React enter its busy state
     for (;;) {
       const cur = findInput();
-      if (!cur) { confirmed = true; break; }        // field itself went away
-      if (cur.value === "") { confirmed = true; break; }
-      if (Date.now() >= confDeadline) break;
+      if (!cur || cur.value === "") return { ok: true, via: "click", confirmed: true };
+      const busy = isBusy();
+      if (busy) sawBusy = true;
+      // "Not busy" only means "finished" once the request has visibly started
+      // (or long enough has passed that it never will).
+      if (!busy && (sawBusy || Date.now() - clickedAt > 3000)) {
+        // Request finished and the URL is still there: the page rejected it.
+        await sleep(150);             // let the toast render
+        const again = findInput();
+        if (!again || again.value === "") return { ok: true, via: "click", confirmed: true };
+        const msg = alertTexts().find((t) => !before.has(t) && !/success/i.test(t)) ||
+                    alertTexts().find((t) => !/success/i.test(t));
+        return { ok: false, rejected: true, error: msg || "LazyApply did not accept the URL" };
+      }
+      if (Date.now() >= confDeadline) return { ok: true, via: "click", confirmed: false };
       await sleep(civ);
-      if (civ < 120) civ = Math.min(120, Math.round(civ * 1.6));
+      if (civ < 250) civ = Math.min(250, Math.round(civ * 1.5));
     }
-    return { ok: true, via: "click", confirmed };
   }
 
   async function findLazyApplyTab() {
@@ -384,9 +646,10 @@
     // disabled on top of that, so "click it and nothing happens" was the
     // entire experience -- with no way to tell an empty list from a
     // broken one. The button stays live and says which it is.
-    if (!masterList.length) {
-      log("Nothing loaded to add. Drop in a CSV of job URLs first \u2014 Greenhouse,");
-      log("Lever, Ashby or Rippling postings. A file of search URLs will not do it.");
+    const searchesLeft = searchList.length - searchIndex;
+    if (!masterList.length && !searchesLeft) {
+      log("Nothing loaded to add. Drop in a CSV with Greenhouse, Lever, Ashby or");
+      log("Rippling job URLs, or Google/Bing search pages that list them.");
       return;
     }
 
@@ -399,7 +662,7 @@
     }
 
     // A completed list re-run from scratch when the user clicks again.
-    if (nextIndex >= masterList.length) { nextIndex = 0; persistQueueState(); }
+    if (!searchesLeft && nextIndex >= masterList.length) { nextIndex = 0; persistQueueState(); }
 
     running = true;
     stopRequested = false;
@@ -407,10 +670,33 @@
     els.stopBtn.disabled = false;
     els.fileInput.disabled = true;
     els.dropzone.classList.add("disabled");
+    const endRun = () => {
+      running = false;
+      els.stopBtn.disabled = true;
+      els.fileInput.disabled = false;
+      els.dropzone.classList.remove("disabled");
+      els.startBtn.disabled = false;
+    };
+
+    // Search pages first: they are turned into job URLs, then queued below.
+    if (searchesLeft) {
+      let ok = false;
+      try { ok = await expandSearches(); }
+      catch (e) { log(`✗ Reading search pages failed: ${e?.message || e}`); persistQueueState(); }
+      if (!ok) { endRun(); return; }
+      if (!masterList.length) {
+        log("No Greenhouse / Lever / Ashby / Rippling job links were on those search pages.");
+        clearQueueState(); endRun(); return;
+      }
+      if (!(await findLazyApplyTab())) {
+        log("\nJob links are saved. Open https://app.lazyapply.com/dashboard (Job Queue), then");
+        log('click "Add to LazyApply Queue" to add them.');
+        endRun(); return;
+      }
+    }
 
     let pace = 1;        // ms between adds; adapts upward if the page struggles
     let injectFails = 0; // consecutive executeScript failures (crashed/reloading tab)
-    let retryUnconfirmed = 0; // one retry per URL that wasn't proven queued
     const unconfirmed = [];   // added-but-not-proven, reported at the end
     let added = 0;
     const failed = [];
@@ -441,21 +727,13 @@
           injectFails = 0;
           if (r.confirmed) {
             added++;
-            retryUnconfirmed = 0;
             pace = Math.max(1, pace - 5);
             log(`Adding ${i + 1}/${masterList.length} ✓  ${url}`);
           } else {
-            // NOT proven queued. Give it one more go at a calmer pace before
-            // accepting it, rather than counting it and moving on.
-            pace = Math.min(400, pace * 2 + 10);
-            if (retryUnconfirmed < 1) {
-              retryUnconfirmed += 1;
-              log(`Adding ${i + 1}/${masterList.length} … unconfirmed, retrying`);
-              await sleep(pace);
-              i -= 1;
-              continue;
-            }
-            retryUnconfirmed = 0;
+            // NOT proven queued within 30 s. Do NOT retry: the request may
+            // still land, and a retry would queue the job twice. Slow down,
+            // record it, and move on.
+            pace = Math.min(2000, pace * 2 + 200);
             unconfirmed.push(url);
             log(`Adding ${i + 1}/${masterList.length} ⚠ unconfirmed  ${url}`);
           }
@@ -488,11 +766,7 @@
       await sleep(pace);
     }
 
-    running = false;
-    els.stopBtn.disabled = true;
-    els.fileInput.disabled = false;
-    els.dropzone.classList.remove("disabled");
-    els.startBtn.disabled = false;
+    endRun();
 
     if (nextIndex >= masterList.length) {
       // Whole list finished — clear saved progress so the next upload starts clean.
@@ -548,17 +822,24 @@
     try {
       const stored = await chrome.storage.local.get(LA_STATE_KEY);
       const s = stored[LA_STATE_KEY];
-      if (s && Array.isArray(s.master) && s.master.length && s.sig === listSignature(s.master)) {
-        masterList = s.master;
-        nextIndex = Math.min(Math.max(0, s.nextIndex || 0), masterList.length);
-        if (nextIndex >= masterList.length) { clearQueueState(); return; }
-        els.startBtn.disabled = false;
-        setProgress(nextIndex / masterList.length);
-        els.summary.textContent =
-          `Restored a previous run.\nTotal: ${masterList.length}\nAlready added: ${nextIndex}` +
-          `\nClick "Add to LazyApply Queue" to resume from #${nextIndex + 1}.`;
-        log(`Restored interrupted run — ${nextIndex}/${masterList.length} already added. Click "Add to LazyApply Queue" to resume from #${nextIndex + 1}.`);
-      }
+      if (!s || !Array.isArray(s.master)) return;
+      const searches = Array.isArray(s.searches) ? s.searches : [];
+      const sIdx = Math.min(Math.max(0, s.searchIndex || 0), searches.length);
+      const nIdx = Math.min(Math.max(0, s.nextIndex || 0), s.master.length);
+      if (sIdx >= searches.length && nIdx >= s.master.length) { clearQueueState(); return; }
+      if (!s.master.length && !searches.length) return;
+      masterList = s.master; nextIndex = nIdx;
+      searchList = searches; searchIndex = sIdx;
+      sourceSig = s.sig || "";
+      els.startBtn.disabled = false;
+      setProgress(masterList.length ? nextIndex / masterList.length : 0);
+      const sLeft = searchList.length - searchIndex;
+      els.summary.textContent =
+        `Restored a previous run.\nJob URLs: ${masterList.length}\nAlready added: ${nextIndex}` +
+        (sLeft ? `\nSearch pages still to open: ${sLeft}` : "") +
+        `\nClick "Add to LazyApply Queue" to continue.`;
+      log(`Restored interrupted run — ${nextIndex}/${masterList.length} added` +
+        (sLeft ? `, ${sLeft} search page(s) still to read` : "") + `. Click "Add to LazyApply Queue" to continue.`);
     } catch (_) {}
   })();
 })();
