@@ -26,7 +26,7 @@
   // Aggregator hosts that must NEVER survive into the exported "Job URL" column —
   // a real ATS link (greenhouse/lever/workday/etc.) is the only acceptable value.
   // If resolution returns one of these (or fails), the URL is treated as unresolved.
-  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|jobright\.ai)$/i;
   function isResolvedExternalUrl(u) {
     if (!u || !/^https?:\/\//i.test(u)) return false;
     try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
@@ -291,6 +291,9 @@
     if (typeof sjIsTarget === "function" && sjIsTarget()) {
       const c = el.closest('[data-testid="job-card"]');
       return c ? (c.closest("button") || c) : null;
+    }
+    if (typeof jrIsTarget === "function" && jrIsTarget()) {
+      return el.closest(JR_CARD_SEL);
     }
     if (typeof ettIsTarget === "function" && ettIsTarget()) {
       return el.closest(".MuiCard-root");
@@ -1313,196 +1316,266 @@ async function chRun(options) {
 //                     end careerhound.io adapter                     
 
 // ===================== jobright.ai adapter =====================
-// jobright.ai/jobs/recommend is a React SPA: an infinite-scrolling list of job
-// cards, each exposing "APPLY WITH AUTOFILL" and/or "APPLY NOW". The employer
-// ATS URL sits on those controls, so we anchor on the CONTROL rather than any
-// CSS class (class names here are hashed and change between builds). Two shapes
-// are handled: the control is an <a href> (read directly), or it is a <button>
-// carrying the URL in a data-* attribute. Internal jobright.ai links are never
-// returned, so the exported Job URL column only ever holds an external link.
+// jobright.ai (/jobs/recommend, /jobs/liked, /jobs/applied, /jobs/external ...)
+// renders a VIRTUALISED infinite-scroll list inside an inner scroll container
+// (div[class*="jobs-page-main-content"]) — NOT window. Only ~8-14 cards are
+// mounted at a time and cards above the viewport are unmounted as you scroll,
+// so the generic "find all cards / scroll window / wait for count to grow"
+// strategies never worked here (card count never grows, window never scrolls).
+//
+// This adapter:
+//   1. scrolls the real inner scroller step-by-step from the top,
+//   2. harvests each mounted card by its stable id (div.job-card-flag-classname#<jobId>)
+//      into a Set, so unmounting/re-mounting never loses or duplicates jobs,
+//   3. enriches each job with the REAL employer apply URL (applyLink/originalUrl)
+//      — first from the page's own list-API responses cached by jobright-main.js,
+//      else by fetching the job's /jobs/info/{id} page and reading __NEXT_DATA__.
+// A picked "Jobs Column" scopes to that list's scroller; a picked pagination /
+// "Load more" button is clicked whenever the bottom is reached.
+const JR_SCROLL_PAUSE_MS = 450;
+const JR_BOTTOM_WAIT_MS = 3000;
+const JR_NO_GROWTH_TRIES = 5;
+const JR_IDLE_STOP_MS = 15000;
+const JR_INFO_CONCURRENCY = 3;
+const JR_END_RE = /adjusting the following criteria|no more jobs|you(?:\u2019|')?ve (?:reached|seen) (?:the end|all)|end of (?:the )?list/i;
+const JR_CARD_SEL = ".job-card-flag-classname, div[class*='index_job-card__']";
+
 function jrIsTarget() {
   return /(^|\.)jobright\.ai$/i.test(location.hostname);
 }
-const JR_APPLY_RE = /\b(apply\s+with\s+autofill|apply\s+now|autofill|apply)\b/i;
-const JR_SKIP_RE = /(save|hide|not interested|report|more from|similar|feedback|upgrade|sign in|log in)/i;
-function jrIsExternalUrl(u) {
-  if (!u || !/^https?:\/\//i.test(u)) return false;
-  try { return !/(^|\.)jobright\.ai$/i.test(new URL(u, location.href).host); }
-  catch (_) { return false; }
+function jrCardId(card) {
+  if (card.id && /^[a-f0-9]{16,}$/i.test(card.id)) return card.id;
+  const a = card.querySelector('a[href*="/jobs/info/"]') || card.closest('a[href*="/jobs/info/"]');
+  const m = a && a.getAttribute("href").match(/\/jobs\/info\/([A-Za-z0-9]+)/);
+  return m ? m[1] : "";
 }
-// Pull an apply URL out of a scope (a card, or the detail pane).
-function jrApplyUrl(scope) {
-  if (!scope) return "";
-  const controls = Array.from(scope.querySelectorAll('a, button, [role="button"]'));
-  const applyish = controls.filter((el) => {
-    const t = visibleText(el);
-    return t && JR_APPLY_RE.test(t) && !JR_SKIP_RE.test(t);
-  });
-  // 1) Apply control that is itself a link.
-  for (const el of applyish) {
-    if (el.tagName === "A" && jrIsExternalUrl(el.href)) return el.href;
-  }
-  // 2) Apply control carrying the URL in a data-* attribute.
-  for (const el of applyish) {
-    for (const k of ["data-url", "data-href", "data-apply-url", "data-link", "data-external-url", "href"]) {
-      const v = el.getAttribute && el.getAttribute(k);
-      if (v && jrIsExternalUrl(v)) return v;
+function jrAllCards(root) {
+  return Array.from((root || document).querySelectorAll(JR_CARD_SEL))
+    .filter((c) => !c.parentElement || !c.parentElement.closest(JR_CARD_SEL)) // outermost only
+    .filter((c) => jrCardId(c));
+}
+function jrIsScrollable(el) {
+  if (!el || el === document.body || el === document.documentElement) return false;
+  const oy = getComputedStyle(el).overflowY;
+  return /(auto|scroll|overlay)/.test(oy) && el.scrollHeight > el.clientHeight + 20;
+}
+function jrScrollerFor(el) {
+  let n = el;
+  while (n && n !== document.body) { if (jrIsScrollable(n)) return n; n = n.parentElement; }
+  return null;
+}
+function jrFindScroller(columnSpec) {
+  if (columnSpec) {
+    const picked = findByElementSpec(columnSpec);
+    if (picked) {
+      const s = jrIsScrollable(picked) ? picked : jrScrollerFor(picked);
+      if (s) return s;
     }
   }
-  // 3) An apply control wrapping (or wrapped by) an external anchor.
-  for (const el of applyish) {
-    const inner = el.querySelector && el.querySelector("a[href]");
-    if (inner && jrIsExternalUrl(inner.href)) return inner.href;
-    const outer = el.closest && el.closest("a[href]");
-    if (outer && jrIsExternalUrl(outer.href)) return outer.href;
-  }
-  // 4) Last resort: any external anchor inside the scope.
-  const ext = Array.from(scope.querySelectorAll("a[href]"))
-    .find((a) => jrIsExternalUrl(a.href) && !JR_SKIP_RE.test(visibleText(a)));
-  return ext ? ext.href : "";
+  const main = document.querySelector('[class*="jobs-page-main-content"]');
+  if (main && jrIsScrollable(main)) return main;
+  const first = jrAllCards()[0];
+  return (first && jrScrollerFor(first)) || document.scrollingElement || document.documentElement;
 }
-// Cards are derived by climbing from each apply control to the smallest
-// ancestor that looks like a whole listing (enough text, not the entire page).
-function jrGetCards() {
-  const controls = Array.from(document.querySelectorAll('a, button, [role="button"]'))
-    .filter((el) => {
-      const t = visibleText(el);
-      return t && JR_APPLY_RE.test(t) && !JR_SKIP_RE.test(t) && isVisible(el);
-    });
-  const cards = [];
-  const seen = new Set();
-  for (const ctl of controls) {
-    let node = ctl.parentElement, card = null, safety = 0;
-    while (node && node !== document.body && safety < 25) {
-      const txt = visibleText(node);
-      if (txt.length > 60 && node.querySelectorAll("a, button").length < 40) { card = node; break; }
-      node = node.parentElement; safety += 1;
-    }
-    if (card && !seen.has(card)) { seen.add(card); cards.push(card); }
-  }
-  return cards;
+function jrAtBottom(s) { return s.scrollTop + s.clientHeight >= s.scrollHeight - 8; }
+function jrNudge(s, top) {
+  s.scrollTop = top;
+  try { s.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (_) {}
+  try { s.dispatchEvent(new WheelEvent("wheel", { deltaY: 600, bubbles: true, cancelable: true })); } catch (_) {}
 }
-function jrCardTitle(card) {
-  const h = card.querySelector("h1,h2,h3,h4,h5,h6");
-  if (h && visibleText(h)) return visibleText(h);
-  let best = "", bestScore = 0;
-  for (const el of card.querySelectorAll("*")) {
-    if (el.children.length) continue;
-    const t = visibleText(el);
-    if (!t || t.length < 3 || t.length > 200) continue;
-    if (JR_APPLY_RE.test(t) || JR_SKIP_RE.test(t)) continue;
-    const cs = window.getComputedStyle(el);
-    const score = (parseFloat(cs.fontSize) || 0) + ((parseInt(cs.fontWeight, 10) || 400) >= 600 ? 4 : 0);
-    if (score > bestScore) { bestScore = score; best = t; }
-  }
-  return best;
-}
-function jrCardCompany(card, title) {
-  const img = card.querySelector("img[alt]");
-  const alt = img && img.alt ? img.alt.trim() : "";
-  if (alt && !/logo|icon|avatar|^$/i.test(alt)) return alt;
-  for (const el of card.querySelectorAll("*")) {
-    if (el.children.length) continue;
-    const t = visibleText(el);
-    if (!t || t === title || t.length > 80) continue;
-    if (JR_APPLY_RE.test(t) || JR_SKIP_RE.test(t)) continue;
-    if (/^\d+\s*[smhdw]$/i.test(t) || /[€£$]\s?\d/.test(t)) continue;
-    return t;
-  }
-  return "";
-}
-function jrBuildRow(card) {
-  const url = jrApplyUrl(card);
-  const title = jrCardTitle(card);
-  const chips = Array.from(card.querySelectorAll("span, div, button")).map(visibleText).filter(Boolean);
-  let work_mode = "", commitment = "", salary = "", posted_age = "";
-  for (const c of chips) {
-    const lc = c.toLowerCase();
-    if (!work_mode && CH_MODE_VALUES.has(lc)) work_mode = c;
-    else if (!commitment && CH_COMMIT_VALUES.has(lc)) commitment = c;
-    else if (!salary && CH_SALARY_RE.test(c) && c.length < 40) salary = c;
-    else if (!posted_age && CH_AGE_RE.test(c)) posted_age = c;
-  }
+function jrCardFallback(card) {
+  const title = visibleText(card.querySelector("h2, h3")) || "";
+  const lines = (card.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean);
+  const ti = lines.indexOf(title);
+  const compLine = ti >= 0 ? (lines[ti + 1] || "") : "";
   return {
-    url: url,
-    title: title,
-    company: jrCardCompany(card, title),
-    location: "",
-    salary: salary,
-    work_mode: work_mode,
-    commitment: commitment,
-    yoe: "",
-    posted_age: posted_age,
-    description: "",
-    skills: "",
-    job_posting_initial_url: url,
-    hiringcafe_viewall_url: location.href,
-    status: url ? "ok" : "no apply url found on card",
-    method: "jobright-apply-href",
+    title,
+    company: compLine.split(" / ")[0].trim(),
+    posted: lines.find((l) => /\bago$/i.test(l)) || ""
+  };
+}
+function jrAskCache(ids) {
+  return new Promise((resolve) => {
+    const nonce = "jr" + Date.now() + ":" + Math.random();
+    function onMsg(e) {
+      if (e.source !== window || !e.data || e.data.__jrRes !== nonce) return;
+      window.removeEventListener("message", onMsg);
+      resolve(Array.isArray(e.data.rows) ? e.data.rows : []);
+    }
+    window.addEventListener("message", onMsg);
+    window.postMessage({ __jrReq: nonce, ids }, "*");
+    setTimeout(() => { window.removeEventListener("message", onMsg); resolve([]); }, 1500);
+  });
+}
+function jrCompact(item) {
+  const jr = item.jobResult || {}, cr = item.companyResult || {};
+  return {
+    id: jr.jobId, title: jr.jobTitle || "", company: cr.companyName || "",
+    location: jr.jobLocation || "", locations: Array.isArray(jr.jobLocations) ? jr.jobLocations : [],
+    is_remote: !!jr.isRemote, work_model: jr.workModel || "", salary: jr.salaryDesc || "",
+    employment_type: jr.employmentType || "", seniority: jr.jobSeniority || "",
+    min_yoe: jr.minYearsOfExperience, posted: jr.publishTimeDesc || "",
+    apply_link: jr.applyLink || "", original_url: jr.originalUrl || "",
+    summary: jr.jobSummary || "",
+    skills: Array.isArray(jr.jdCoreSkills)
+      ? jr.jdCoreSkills.map((s) => (s && (s.skill || s.name)) || s).filter((s) => typeof s === "string") : []
+  };
+}
+async function jrFetchInfo(id) {
+  try {
+    const resp = await fetch(location.origin + "/jobs/info/" + encodeURIComponent(id), { credentials: "include" });
+    if (!resp.ok) return null;
+    const html = await resp.text();
+    const m = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (!m) return null;
+    const pp = (JSON.parse(m[1]).props || {}).pageProps || {};
+    const ds = pp.dataSource || null;
+    return ds && ds.jobResult ? jrCompact(ds) : null;
+  } catch (_) { return null; }
+}
+const JR_TRACKING = /^(utm_[a-z]+|gh_src|ref|src|source|referrer|jobright.*)$/i;
+function jrCleanUrl(u) {
+  try {
+    const x = new URL(u);
+    for (const k of Array.from(x.searchParams.keys())) if (JR_TRACKING.test(k)) x.searchParams.delete(k);
+    return x.toString();
+  } catch (_) { return u; }
+}
+function jrAtsProvider(u) {
+  let h = "";
+  try { h = new URL(u).host.toLowerCase(); } catch (_) { return ""; }
+  const map = [
+    [/greenhouse\.io/, "Greenhouse"], [/lever\.co/, "Lever"], [/ashbyhq\.com/, "Ashby"],
+    [/myworkdayjobs\.com|workday\.com/, "Workday"], [/icims\.com/, "iCIMS"],
+    [/smartrecruiters\.com/, "SmartRecruiters"], [/workable\.com/, "Workable"],
+    [/bamboohr\.com/, "BambooHR"], [/rippling\.com/, "Rippling"], [/taleo\.net/, "Taleo"],
+    [/successfactors|sapsf/, "SuccessFactors"], [/oraclecloud\.com/, "Oracle"],
+    [/jobvite\.com/, "Jobvite"], [/teamtailor\.com/, "Teamtailor"], [/personio\./, "Personio"],
+    [/recruitee\.com/, "Recruitee"], [/comeet\./, "Comeet"], [/linkedin\.com/, "LinkedIn"],
+    [/eightfold\.ai/, "Eightfold"], [/avature\.net/, "Avature"], [/jazzhr|applytojob\.com/, "JazzHR"]
+  ];
+  for (const [re, name] of map) if (re.test(h)) return name;
+  return "Company site";
+}
+function jrBuildRow(id, d, fb) {
+  d = d || {};
+  const candidates = [d.apply_link, d.original_url].filter(Boolean);
+  const ext = candidates.find((u) => isResolvedExternalUrl(u)) || "";
+  const url = ext ? jrCleanUrl(ext) : "";
+  const locs = (d.locations && d.locations.length) ? d.locations : (d.location ? [d.location] : []);
+  return {
+    url,
+    ats_provider: url ? jrAtsProvider(url) : "",
+    title: d.title || (fb && fb.title) || "",
+    company: d.company || (fb && fb.company) || "",
+    location: locs.map((l) => (typeof l === "string" ? l : (l && (l.location || l.name)) || "")).filter(Boolean).join(" | "),
+    salary: d.salary || "",
+    work_mode: d.work_model || (d.is_remote ? "Remote" : ""),
+    commitment: d.employment_type || "",
+    yoe: d.min_yoe != null && d.min_yoe !== "" ? (d.min_yoe + "+ yrs") : (d.seniority || ""),
+    posted_age: d.posted || (fb && fb.posted) || "",
+    description: d.summary || "",
+    skills: (d.skills || []).join(", "),
+    job_posting_initial_url: candidates[0] || "",
+    hiringcafe_viewall_url: location.origin + "/jobs/info/" + id,
+    status: url ? "ok" : (d.title ? "no external apply url (jobright-hosted apply)" : "error: job details unavailable"),
+    method: d.__src || "",
     scraped_at: new Date().toISOString()
   };
 }
-// The recommend feed is infinite scroll: scrape what's rendered, scroll, repeat
-// until no new cards appear. Dedupe by URL (falling back to title|company) so a
-// re-render can't produce duplicate rows or an endless loop.
 async function jrRun(options) {
   options = options || {};
   aborted = false;
   const start = Date.now();
-  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !jrGetCards().length) await sleep(150);
-  if (!jrGetCards().length) {
-    await send("SCRAPE_DONE", { error: 'No job cards found on jobright.ai — make sure the job list with "Apply now" / "Apply with autofill" buttons is visible.' });
-    return;
-  }
+  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !jrAllCards().length) await sleep(150);
+  if (!jrAllCards().length) { await send("SCRAPE_DONE", { error: "No job cards found on jobright.ai. Open a jobs list (e.g. /jobs/recommend) first." }); return; }
+
+  const scroller = jrFindScroller(options.columnSpec);
+  const scope = scroller === document.scrollingElement || scroller === document.documentElement ? document : scroller;
+  // Virtualised list: jobs above the viewport are unmounted, so start at the top.
+  jrNudge(scroller, 0);
+  await sleep(700);
+
   const seen = new Set();
-  let pageIndex = 0, noGrowth = 0, total = 0;
-  while (!aborted) {
-    pageIndex += 1;
-    // Jobright's apply URL may live only in React state (the button can be a
-    // handler with no href), so ask the MAIN-world helper as well.
-    const fiber = await fiberRequestUrls();
-    const cards = jrGetCards();
-    let newThisPass = 0;
-    for (const card of cards) {
-      if (aborted) break;
-      const row = jrBuildRow(card);
-      if (!row.url) {
-        const h = card.querySelector("h1,h2,h3,h4,h5,h6");
-        const key = h ? visibleText(h) : visibleText(card).slice(0, 80);
-        const fromFiber = fiber.byTitle.get(key) || (row.title && fiber.byTitle.get(row.title));
-        if (fromFiber && isResolvedExternalUrl(fromFiber)) {
-          row.url = fromFiber;
-          row.job_posting_initial_url = fromFiber;
-          row.status = "ok";
-          row.method = "fiber-apply-url";
-        }
+  const queue = [];
+  let scraped = 0, batch = 0, active = 0;
+  const waiters = [];
+  const acquire = () => active < JR_INFO_CONCURRENCY ? (active++, Promise.resolve()) : new Promise((r) => waiters.push(r));
+  const release = () => { const w = waiters.shift(); if (w) w(); else active--; };
+
+  async function processBatch(items, pageIndex) {
+    const cached = await jrAskCache(items.map((x) => x.id));
+    const byId = new Map(cached.map((r) => [r.id, Object.assign(r, { __src: "list-api" })]));
+    await Promise.all(items.map(async ({ id, fb }) => {
+      if (aborted) return;
+      let d = byId.get(id);
+      if (!d) {
+        await acquire();
+        try { if (!aborted) { d = await jrFetchInfo(id); if (d) d.__src = "info-page"; } }
+        finally { release(); }
       }
-      const key = row.url || (row.title + "|" + row.company);
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      try { card.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
-      await send("JOB_SCRAPED", { row });
-      newThisPass += 1; total += 1;
-      if (total % 4 === 0)
-        await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: total, status: "running" });
-    }
-    await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: total, status: "running" });
-    if (aborted) break;
-    if (newThisPass === 0) {
-      noGrowth += 1;
-      if (noGrowth >= APPEND_NO_GROWTH_TRIES) break;
-    } else noGrowth = 0;
-    const before = jrGetCards().length;
-    window.scrollBy({ top: SCROLL_STEP_PX, behavior: "auto" });
-    await sleep(SCROLL_PAUSE_MS);
-    if (jrGetCards().length === before) {
-      window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "auto" });
-      await sleep(SCROLL_PAUSE_MS);
-    }
+      if (aborted) return;
+      await send("JOB_SCRAPED", { row: jrBuildRow(id, d, fb) });
+      scraped += 1;
+      await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: scraped, status: "running" });
+    }));
   }
+  function harvest() {
+    const fresh = [];
+    for (const c of jrAllCards(scope)) {
+      const id = jrCardId(c);
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      fresh.push({ id, fb: jrCardFallback(c) });
+    }
+    return fresh;
+  }
+
+  let noGrowth = 0, lastFreshAt = Date.now();
+  while (!aborted) {
+    const fresh = harvest();
+    // Hard stop: nothing new for JR_IDLE_STOP_MS means the list is exhausted.
+    if (!fresh.length && Date.now() - lastFreshAt > JR_IDLE_STOP_MS) break;
+    if (fresh.length) {
+      noGrowth = 0; batch += 1; lastFreshAt = Date.now();
+      queue.push(processBatch(fresh, batch));
+    }
+    if (!jrAtBottom(scroller)) {
+      const before = scroller.scrollTop;
+      jrNudge(scroller, before + Math.max(300, Math.floor(scroller.clientHeight * 0.8)));
+      await sleep(JR_SCROLL_PAUSE_MS);
+      if (Math.abs(scroller.scrollTop - before) > 2) continue; // moved — keep harvesting
+      // Scroll position is stuck -> effectively at the bottom.
+    }
+    // At the bottom: click a picked "Load more"/next control if there is one,
+    // otherwise nudge the scroller so the infinite loader fires, then wait for
+    // NEW job ids (virtualiser re-measuring scrollHeight must not count as growth).
+    const btn = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
+    if (btn && !btn.disabled) clickAt(btn);
+    const last = jrAllCards(scope).pop();
+    try { if (last) last.scrollIntoView({ block: "end" }); } catch (_) {}
+    jrNudge(scroller, scroller.scrollHeight);
+    const t0 = Date.now();
+    let grew = false;
+    while (Date.now() - t0 < JR_BOTTOM_WAIT_MS && !aborted) {
+      await sleep(250);
+      if (jrAllCards(scope).some((c) => !seen.has(jrCardId(c)))) { grew = true; break; }
+    }
+    if (grew) continue;
+    noGrowth += 1;
+    // jobright shows an explicit end-of-list panel ("Try adjusting the following
+    // criteria to view more jobs") — once it's there, one confirmation is enough.
+    if (JR_END_RE.test(visibleText(scope === document ? document.body : scope).slice(-2000))) noGrowth = JR_NO_GROWTH_TRIES;
+    if (noGrowth >= JR_NO_GROWTH_TRIES) break;
+    // Wiggle up a bit and back down — re-triggers IntersectionObserver-based loaders.
+    jrNudge(scroller, Math.max(0, scroller.scrollTop - 400));
+    await sleep(200);
+    jrNudge(scroller, scroller.scrollHeight);
+  }
+  await Promise.all(queue);
   await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
 }
-//                     end jobright.ai adapter
+// =================== end jobright.ai adapter ===================
 
 async function runScrape(options) {
   if (jrIsTarget()) { return jrRun(options); }

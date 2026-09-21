@@ -620,6 +620,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
             .catch(async () => {
               try {
+                if (/jobright\.ai$/i.test(hostOf(target.url))) {
+                  // Tab was open before the extension loaded: add the MAIN-world
+                  // API listener too (later list pages get cached; earlier ones
+                  // fall back to per-job detail fetches).
+                  await chrome.scripting.executeScript({ target: { tabId: target.id }, files: ["jobright-main.js"], world: "MAIN" }).catch(() => {});
+                }
                 await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [contentScriptFor(target.url)] });
                 await chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} });
               } catch (e2) {
