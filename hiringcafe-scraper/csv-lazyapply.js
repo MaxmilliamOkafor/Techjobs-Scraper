@@ -334,19 +334,33 @@
     }
     if (btn.disabled) return { ok: false, error: "Add button stayed disabled (URL rejected by page)" };
 
+    // The field must actually hold THIS url at click time. React can revert a
+    // programmatic value; clicking Add then queues nothing (or the previous
+    // URL) while still looking like a successful add.
+    const pre = findInput();
+    if (!pre || pre.value !== url) {
+      return { ok: false, error: "input did not hold the URL at click time" };
+    }
+
     btn.click();
 
-    // Confirmation: on a successful add MUI clears the field and the button
-    // returns to disabled. Check the CHEAP signal (btn.disabled) before the
-    // expensive findInput() scan, and back the interval off so a slow add costs
-    // a handful of DOM scans rather than hundreds.
+    // Confirmation. LazyApply consumes a URL by CLEARING the field, and that
+    // clear is the ONLY unambiguous proof the job was queued.
+    //
+    // btn.disabled must NOT be used as the success signal: the button is
+    // disabled whenever the field is empty, so it is also the button's resting
+    // state, and it can read disabled transiently in the moment after a click.
+    // Checking it first, before any settle, reported "added" for URLs that were
+    // never queued — the log showed a tick for every row while the queue
+    // received far fewer jobs.
     let confirmed = false;
     const confDeadline = Date.now() + 2500;
     let civ = 10;
+    await sleep(civ);                 // let React process the click before looking
     for (;;) {
-      if (btn.disabled) { confirmed = true; break; }
       const cur = findInput();
-      if (cur && cur.value === "") { confirmed = true; break; }
+      if (!cur) { confirmed = true; break; }        // field itself went away
+      if (cur.value === "") { confirmed = true; break; }
       if (Date.now() >= confDeadline) break;
       await sleep(civ);
       if (civ < 120) civ = Math.min(120, Math.round(civ * 1.6));
@@ -396,6 +410,8 @@
 
     let pace = 1;        // ms between adds; adapts upward if the page struggles
     let injectFails = 0; // consecutive executeScript failures (crashed/reloading tab)
+    let retryUnconfirmed = 0; // one retry per URL that wasn't proven queued
+    const unconfirmed = [];   // added-but-not-proven, reported at the end
     let added = 0;
     const failed = [];
     const startAt = nextIndex;
@@ -422,11 +438,27 @@
         });
         const r = res && res.result;
         if (r && r.ok) {
-          added++;
           injectFails = 0;
-          if (r.confirmed) pace = Math.max(1, pace - 5);
-          else pace = Math.min(400, pace * 2 + 10);
-          log(`Adding ${i + 1}/${masterList.length} ✓${r.confirmed ? "" : " (unconfirmed)"}  ${url}`);
+          if (r.confirmed) {
+            added++;
+            retryUnconfirmed = 0;
+            pace = Math.max(1, pace - 5);
+            log(`Adding ${i + 1}/${masterList.length} ✓  ${url}`);
+          } else {
+            // NOT proven queued. Give it one more go at a calmer pace before
+            // accepting it, rather than counting it and moving on.
+            pace = Math.min(400, pace * 2 + 10);
+            if (retryUnconfirmed < 1) {
+              retryUnconfirmed += 1;
+              log(`Adding ${i + 1}/${masterList.length} … unconfirmed, retrying`);
+              await sleep(pace);
+              i -= 1;
+              continue;
+            }
+            retryUnconfirmed = 0;
+            unconfirmed.push(url);
+            log(`Adding ${i + 1}/${masterList.length} ⚠ unconfirmed  ${url}`);
+          }
         } else {
           injectFails = 0;
           failed.push({ url, error: (r && r.error) || "unknown" });
@@ -466,7 +498,11 @@
       // Whole list finished — clear saved progress so the next upload starts clean.
       setProgress(1);
       clearQueueState();
-      log(`\n✔ Done. Added this run: ${added}.  Failed/skipped: ${failed.length}.`);
+      log(`\n✔ Done. Confirmed added: ${added}.  Unconfirmed: ${unconfirmed.length}.  Failed: ${failed.length}.`);
+      if (unconfirmed.length) {
+        log("Unconfirmed (LazyApply never cleared the field — check the queue for these):");
+        unconfirmed.forEach((u) => log(`  • ${u}`));
+      }
     } else {
       setProgress(nextIndex / masterList.length);
     }
