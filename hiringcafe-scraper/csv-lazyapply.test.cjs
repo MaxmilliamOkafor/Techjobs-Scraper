@@ -198,5 +198,49 @@ console.log('\nANY JOB-URL CSV SHAPE WORKS');
   t('  a search page is still NOT a job', srch.urls.length === 0 && srch.rejected === 1, JSON.stringify(srch));
 }
 
+console.log('\nAND SLEEPING THE MACHINE DOES NOT END THE RUN FOR GOOD');
+{
+  // Reported as: the PC sleeps, everything stops, and on waking there is
+  // no resume and no working button.
+  //
+  // On sleep the panel is usually NOT reloaded — the restore path only
+  // runs on load, so it never fired. The panel stayed open with running
+  // === true driving a loop that never woke, because the tab underneath
+  // it had been discarded. runQueue then returned at once on `if
+  // (running) return`, Start had been disabled since the run began, and
+  // Stop only set a flag the dead loop would never read. Three separate
+  // reasons nothing could move it again.
+  t('  a stalled run is noticed', /setInterval\(/.test(src) && /STALL_MS/.test(src),
+    'nothing watches a loop that stops');
+  t('  ...after longer than the slowest single add',
+    /STALL_MS = (\d+)/.test(src) && Number(RegExp.$1) > 30000,
+    'it would fire during a slow but healthy add');
+  t('  ...and hands the controls back', /function abandonRun/.test(src),
+    'the buttons stay locked');
+  t('  ...and says what happened',
+    /computer sleeping will do this/.test(src), 'a silent unlock explains nothing');
+  t('  ...and carries on by itself', /autoResumes < MAX_AUTO_RESUMES/.test(src),
+    'waking up should not need a click');
+  t('  ...but not forever', /MAX_AUTO_RESUMES = \d+/.test(src), 'a restart storm');
+
+  // The subtle one. A loop the watchdog gave up on can still be sitting
+  // in an await; when it finally returns, a newer run is underway and
+  // both would add the same URLs.
+  t('  a superseded loop stands down', /myRun !== runGeneration/.test(src),
+    'two loops would queue the same URLs twice');
+  t('  ...checked before adding and before finishing',
+    (src.match(/myRun !== runGeneration/g) || []).length >= 2,
+    'only one of the two exits is guarded');
+  t('  the loop feeds the watchdog', /lastTickAt = Date\.now\(\)/.test(src),
+    'nothing to notice the stall by');
+
+  t('  Stop works even on a dead loop', /if \(running && Date\.now\(\) - lastTickAt > 5000\) abandonRun/.test(src),
+    'Stop would set a flag nobody reads');
+  t('  the button says it will resume', /Resume from #\$\{nextIndex \+ 1\}/.test(src),
+    'no way to tell it will continue rather than restart');
+  t('  ...and is relabelled after every URL', /updateStartLabel\(\)/.test(src),
+    'the number would go stale mid-run');
+}
+
 console.log('\n' + PASS + ' passed, ' + FAIL + ' failed');
 process.exit(FAIL ? 1 : 0);

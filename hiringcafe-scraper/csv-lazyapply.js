@@ -119,6 +119,24 @@
   let running = false;
   let stopRequested = false;
 
+  // SLEEPING THE MACHINE USED TO END THE RUN AND LOCK THE BUTTON.
+  //
+  // On sleep the panel is usually NOT reloaded: it stays open with
+  // running === true and a loop that never wakes, because the tab it was
+  // driving was discarded underneath it. runQueue then returns
+  // immediately (`if (running) return`), Start is disabled from when the
+  // run began, and Stop only sets a flag that the dead loop never reads.
+  // Nothing could move it again short of reopening the panel.
+  //
+  // So: a heartbeat the loop touches after every URL, a watchdog that
+  // notices when it stops, and a generation number so a loop that wakes
+  // up later finds itself superseded and exits instead of double-adding.
+  let runGeneration = 0;
+  let lastTickAt = 0;
+  let autoResumes = 0;
+  const STALL_MS = 45000;      // longer than the slowest single add (30s)
+  const MAX_AUTO_RESUMES = 5;
+
   // Progress is persisted so a run RESUMES where it stopped instead of restarting
   // from the top, and survives the side panel being torn down / reloaded mid-run
   // (which is the usual cause of it "randomly stopping").
@@ -509,6 +527,8 @@
 
     running = true;
     stopRequested = false;
+    const myRun = ++runGeneration;   // a later run supersedes this one
+    lastTickAt = Date.now();
     els.startBtn.disabled = true;
     els.stopBtn.disabled = false;
     els.fileInput.disabled = true;
@@ -531,7 +551,10 @@
 
     let i = startAt;
     for (; i < masterList.length; i++) {
-      if (stopRequested) { nextIndex = i; persistQueueState(); log(`\n■ Stopped at ${i}/${masterList.length}. Click "Add to LazyApply Queue" to resume from #${i + 1}.`); break; }
+      // A run the watchdog gave up on must not carry on adding when it
+      // finally wakes: there is a newer one, and both would queue.
+      if (myRun !== runGeneration) return;
+      if (stopRequested) { nextIndex = i; persistQueueState(); log(`\n■ Stopped at ${i}/${masterList.length}. Click "Resume from #${i + 1}" to carry on.`); break; }
       const url = masterList[i];
       setProgress(i / masterList.length);
       // Re-find the tab every iteration so a closed/re-opened LazyApply tab (a
@@ -587,13 +610,17 @@
       // a mid-run teardown resumes here instead of restarting from the top.
       nextIndex = i + 1;
       persistQueueState();
+      lastTickAt = Date.now();     // the heartbeat the watchdog reads
+      updateStartLabel();
     }
 
+    if (myRun !== runGeneration) return;   // superseded: leave the newer run alone
     running = false;
     els.stopBtn.disabled = true;
     els.fileInput.disabled = false;
     els.dropzone.classList.remove("disabled");
     els.startBtn.disabled = false;
+    updateStartLabel();
 
     if (nextIndex >= masterList.length) {
       // Whole list finished — clear saved progress so the next upload starts clean.
@@ -640,8 +667,51 @@
     if (dt && dt.files && dt.files.length) handleFiles(dt.files);
   });
 
+  function updateStartLabel() {
+    const resuming = !running && masterList.length && nextIndex > 0 && nextIndex < masterList.length;
+    els.startBtn.textContent = resuming
+      ? `Resume from #${nextIndex + 1} of ${masterList.length}`
+      : "Add to LazyApply Queue";
+  }
+
+  /** Give the controls back when the loop is gone, wherever it went. */
+  function abandonRun(why) {
+    runGeneration += 1;        // anything still in flight is now superseded
+    running = false;
+    stopRequested = false;
+    els.stopBtn.disabled = true;
+    els.fileInput.disabled = false;
+    els.dropzone.classList.remove("disabled");
+    els.startBtn.disabled = false;
+    persistQueueState();
+    updateStartLabel();
+    if (why) log(why);
+  }
+
   els.startBtn.addEventListener("click", runQueue);
-  els.stopBtn.addEventListener("click", () => { stopRequested = true; els.stopBtn.disabled = true; });
+  els.stopBtn.addEventListener("click", () => {
+    stopRequested = true;
+    els.stopBtn.disabled = true;
+    // If the loop is already dead it will never read that flag, so give
+    // the controls back rather than leaving Stop as a button that lies.
+    setTimeout(() => { if (running && Date.now() - lastTickAt > 5000) abandonRun(null); }, 1200);
+  });
+
+  // The watchdog. Fires on a slept machine, a crashed tab, or a torn-down
+  // worker -- it does not need to know which.
+  setInterval(() => {
+    if (!running || !lastTickAt) return;
+    if (Date.now() - lastTickAt < STALL_MS) return;
+    abandonRun(`\n■ The run stopped responding at ${nextIndex}/${masterList.length}` +
+      ` (the computer sleeping will do this). Progress is saved.`);
+    if (autoResumes < MAX_AUTO_RESUMES && nextIndex < masterList.length) {
+      autoResumes += 1;
+      log(`Picking it back up from #${nextIndex + 1}…`);
+      runQueue();
+    } else if (nextIndex < masterList.length) {
+      log(`Press "Resume from #${nextIndex + 1}" when the LazyApply tab is back.`);
+    }
+  }, 5000);
 
   // Restore an interrupted run when the side panel reloads, so the list and the
   // resume point survive a teardown and the user can continue with one click.
@@ -654,11 +724,13 @@
         nextIndex = Math.min(Math.max(0, s.nextIndex || 0), masterList.length);
         if (nextIndex >= masterList.length) { clearQueueState(); return; }
         els.startBtn.disabled = false;
+        updateStartLabel();
         setProgress(nextIndex / masterList.length);
         els.summary.textContent =
           `Restored a previous run.\nTotal: ${masterList.length}\nAlready added: ${nextIndex}` +
-          `\nClick "Add to LazyApply Queue" to resume from #${nextIndex + 1}.`;
-        log(`Restored interrupted run — ${nextIndex}/${masterList.length} already added. Click "Add to LazyApply Queue" to resume from #${nextIndex + 1}.`);
+          `\nPress the button to carry on from #${nextIndex + 1}.`;
+        log(`Restored interrupted run — ${nextIndex}/${masterList.length} already added.`);
+        log(`Press "Resume from #${nextIndex + 1}" once the LazyApply Job Queue tab is open.`);
       }
     } catch (_) {}
   })();
