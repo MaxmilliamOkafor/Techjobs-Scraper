@@ -113,14 +113,9 @@ console.log('\nAND IT SAYS WHAT IT TURNED AWAY, NOT ONLY HOW MANY IT KEPT');
   const r = M.scanCsv(searches);
   t('  nothing supported', r.urls.length === 0, JSON.stringify(r.urls));
   t('  ...but the rows were read', r.rows === 3, String(r.rows));
-  // Search pages are no longer a rejection: they are COLLECTED, to be opened
-  // and mined for the job links they list. So they are counted as searches,
-  // and neither inflate `rejected` nor appear in the turned-away host list.
-  t('  ...and collected as searches, not rejections', r.searches.length === 3,
-    JSON.stringify(r.searches));
-  t('  ...so nothing is counted as rejected', r.rejected === 0, String(r.rejected));
-  t('  ...and the turned-away host list stays empty',
-    Array.isArray(r.hosts) && r.hosts.length === 0, JSON.stringify(r.hosts));
+  t('  ...and counted as rejected', r.rejected === 3, String(r.rejected));
+  t('  ...and named, commonest first',
+    r.hosts[0][0] === 'google.com' && r.hosts[0][1] === 2, JSON.stringify(r.hosts));
 
   // The three cases the old message could not distinguish.
   const empty = M.scanCsv('');
@@ -138,10 +133,8 @@ console.log('\nAND THE SUMMARY ACTUALLY USES ANY OF THAT');
 {
   t('  the per-file line reports skipped', /\$\{p\.rejected\} skipped/.test(src),
     'the count is collected and never shown');
-  // Search pages are an accepted input now, not a cause of zero: the summary
-  // has to say they were found and will be opened for the links they list.
-  t('  the search-page case is named outright', /search page\(s\)/.test(src),
-    'search pages would be collected with nothing said about them');
+  t('  the search-page case is named outright', /SEARCH pages, not job postings/.test(src),
+    'the commonest cause of 0 would go unexplained');
   t('  the platforms it drives are listed', /Greenhouse, Lever, Ashby, Rippling/.test(src),
     'no way to know what it wanted instead');
   t('  the no-rows case is separate', /no readable rows/.test(src), 'a parse failure reads as 0 supported');
@@ -166,28 +159,43 @@ console.log('\nAND PRESSING THE BUTTON ALWAYS PRODUCES AN ANSWER');
     !/startBtn\.disabled = master(List)?\.length === 0/.test(src),
     'a dead button is the whole symptom');
 
-  // The whole of runQueue, not a fixed-length window: the function grew when
-  // search-page handling landed and a 2200-char slice stopped reaching the
-  // "Adding N URL(s)" announcement, so the ordering check silently compared
-  // against -1 and failed on correct code.
-  const head = src.slice(src.indexOf('async function runQueue'));
+  // Far enough in to reach the "Adding N URL(s)" announcement, which is
+  // the line the tab check has to come before.
+  const head = src.slice(src.indexOf('async function runQueue'),
+    src.indexOf('async function runQueue') + 3000);
   t('  an empty list is explained, not swallowed',
     /Nothing loaded to add/.test(head) && !/if \(running \|\| !masterList\.length\) return;/.test(src),
     'the silent return is still there');
   t('  ...and it names what the file should have held',
-    /Greenhouse, Lever, Ashby or/.test(head) && /search pages that list them/.test(head),
+    /Greenhouse,/.test(head) && /search URLs will not do it/.test(head),
     'no way to know what was wrong with the file');
-  // The announcement now lives in drainQueue (so each batch of freshly found
-  // links announces itself), and drainQueue is defined above runQueue — so a
-  // source-order check for the banner no longer works. The property being
-  // guarded is unchanged: runQueue must prove a tab exists BEFORE it drains.
   t('  a missing LazyApply tab is caught before the run is announced',
-    head.indexOf('No LazyApply tab is open') < head.indexOf('await drainQueue()'),
+    head.indexOf('No LazyApply tab is open') < head.indexOf('▶ Adding'),
     'it would print "Adding N URL(s)" and then immediately pause at 0');
   t('  ...and says where to open it',
     /app\.lazyapply\.com\/dashboard/.test(head), 'nowhere to go from the message');
   t('  the run still guards against double-starting',
     /if \(running\) return;/.test(head), 'a second click would start a parallel run');
+}
+
+console.log('\nANY JOB-URL CSV SHAPE WORKS');
+{
+  const loose = 'Company,Notes,Link\r\n'
+    + 'Acme,"see https://job-boards.greenhouse.io/acme/jobs/1?gh_src=Simplify and more",x\r\n'
+    + 'Beta,,http://jobs.lever.co/beta/abc-1/\r\n'
+    + 'Gamma,,https://www.google.com/url?q=https://jobs.ashbyhq.com/gamma/uuid-9&sa=U\r\n'
+    + 'Dup,,https://job-boards.greenhouse.io/acme/jobs/1\r\n'
+    + 'Board home,,https://jobs.lever.co/beta\r\n';
+  const r = M.scanCsv(loose);
+  t('  URLs found in any column, inside text', r.urls.includes('https://job-boards.greenhouse.io/acme/jobs/1'), JSON.stringify(r.urls));
+  t('  http and trailing slash normalised', r.urls.includes('https://jobs.lever.co/beta/abc-1'), JSON.stringify(r.urls));
+  t('  redirect wrappers unwrapped', r.urls.includes('https://jobs.ashbyhq.com/gamma/uuid-9'), JSON.stringify(r.urls));
+  t('  the same job reached two ways is queued once', r.urls.length === 3, JSON.stringify(r.urls));
+  t('  a board home page is not a job', !r.urls.some((u) => /lever\.co\/beta$/.test(u)), JSON.stringify(r.urls));
+  t('  a headerless plain list works', M.scanCsv('https://jobs.ashbyhq.com/a/b\nhttps://jobs.lever.co/c/d\n').urls.length === 2, 'plain list');
+  t('  several links in one cell', M.scanCsv('links\r\n"https://jobs.ashbyhq.com/a/b | https://jobs.lever.co/c/d"\r\n').urls.length === 2, 'multi-link cell');
+  const srch = M.scanCsv('platform,url\r\nx,https://www.google.com/search?q=site%3Agreenhouse.io\r\n');
+  t('  a search page is still NOT a job', srch.urls.length === 0 && srch.rejected === 1, JSON.stringify(srch));
 }
 
 console.log('\n' + PASS + ' passed, ' + FAIL + ' failed');
