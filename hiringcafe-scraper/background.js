@@ -9,12 +9,13 @@ const RESULTS_KEY = "hiringcafe_results";
 // Sites this extension can scrape. Add new sites here to extend support.
 const SITE_MATCHES = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://jobright.ai/*", "https://*.jobright.ai/*",
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -582,6 +583,7 @@ async function findTargetTab(preferTabId) {
 function siteLabelFor(url) {
   const h = hostOf(url);
   if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/jobright\.ai$/i.test(h)) return "jobright.ai";
   if (/careerhound\.io$/i.test(h)) return "careerhound.io";
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
   if (/simplify\.jobs$/i.test(h)) return "simplify.jobs";
@@ -606,7 +608,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_SCRAPE": {
           const target = await findTargetTab();
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
@@ -618,6 +620,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
             .catch(async () => {
               try {
+                if (/jobright\.ai$/i.test(hostOf(target.url))) {
+                  // Tab was open before the extension loaded: add the MAIN-world
+                  // API listener too (later list pages get cached; earlier ones
+                  // fall back to per-job detail fetches).
+                  await chrome.scripting.executeScript({ target: { tabId: target.id }, files: ["jobright-main.js"], world: "MAIN" }).catch(() => {});
+                }
                 await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [contentScriptFor(target.url)] });
                 await chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} });
               } catch (e2) {
@@ -672,7 +680,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_PICKER": {
           const target = await findTargetTab(msg.tabId);
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
           try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {
