@@ -1044,6 +1044,9 @@ function sjBuildRow(r) {
 // (nearest scrollable ancestor) rather than from class names, which are
 // generated and change between builds.
 function sjGetScroller() {
+  // Verified: the results container is itself the scrolling element.
+  const hits = document.querySelector('[data-testid="custom-hits"]');
+  if (hits && hits.scrollHeight > hits.clientHeight + 20) return hits;
   const card = sjGetCardButtons()[0];
   let n = card ? card.parentElement : null;
   while (n && n !== document.body && n !== document.documentElement) {

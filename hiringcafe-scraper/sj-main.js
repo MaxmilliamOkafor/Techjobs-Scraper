@@ -6,8 +6,9 @@
 // job id. This MAIN-world script reads the fibers and answers the content
 // script's postMessage request with serialized rows.
 //
-// Current layout (redesign): each job is a plain <li> with generated styling
-// classes — no data-testid, no link, no job id anywhere in the DOM. The full
+// Current layout (Sept 2026 redesign): each job is a plain <li> inside
+// [data-testid="custom-hits"] (which is also the scrolling element), with
+// generated styling classes — no link and no job id anywhere in the DOM. The full
 // job object (id, title, company, locations, work mode, level, functions,
 // last-updated) is attached to that <li> by React. So cards are found by what
 // their React data CONTAINS, never by markup, and each one found is tagged with
@@ -75,6 +76,18 @@
         const v = o[k];
         if (v && typeof v === "object") stack.push(v);
       }
+    }
+    return null;
+  }
+
+  // Verified location on the live page: the card component above each <li>
+  // carries the job as props.job, within ~4 fiber levels.
+  function directJob(el) {
+    let f = fiberOf(el);
+    for (let i = 0; i < 6 && f; i++) {
+      const j = f.memoizedProps && f.memoizedProps.job;
+      if (looksLikeJob(j)) return j;
+      f = f.return;
     }
     return null;
   }
@@ -148,14 +161,19 @@
     for (const el of legacy) { const hit = getHit(el); if (hit) out.push({ el, hit }); }
     if (out.length) return out;
 
-    // 2) Current layout: <li> items whose React data holds a job. Inner <li>s
-    //    (tags, location chips) inside a card are skipped — the outermost li
-    //    that carries the job is the card.
+    // 2) Current layout: <li> items whose React data holds a job, inside the
+    //    results container [data-testid="custom-hits"]. Scoping matters: a
+    //    filter-sidebar <li> can walk up into a parent that holds every job and
+    //    be mistaken for a card. Only if that container is missing do we fall
+    //    back to scanning every <li> on the page. Inner <li>s (tags, location
+    //    chips) inside a card are skipped — the outermost li is the card.
+    const hitsBox = document.querySelector('[data-testid="custom-hits"]');
+    const candidates = hitsBox ? hitsBox.querySelectorAll("li") : document.querySelectorAll("li");
     const seenIds = new Map();
-    for (const el of document.querySelectorAll("li")) {
+    for (const el of candidates) {
       if (!isVisible(el)) continue;
       if ((el.innerText || "").trim().length < 10) continue;
-      const hit = getHit(el);
+      const hit = directJob(el) || getHit(el);
       if (!hit) continue;
       const id = String(jobId(hit));
       const prev = seenIds.get(id);
@@ -215,7 +233,8 @@
     const fromArrays = new Map();
     harvestArrays(cards.map((c) => c.el), fromArrays);
     for (const [id, j] of fromArrays) if (!byId.has(id)) byId.set(id, j);
-    lastProbe = { liScanned: document.querySelectorAll("li").length, cardEls: cards.length,
+    lastProbe = { hitsBox: !!document.querySelector('[data-testid="custom-hits"]'),
+                  liScanned: document.querySelectorAll("li").length, cardEls: cards.length,
                   withFiber: cards.length, arrayJobs: fromArrays.size, rows: byId.size };
     return Array.from(byId.values()).map(toRow);
   }

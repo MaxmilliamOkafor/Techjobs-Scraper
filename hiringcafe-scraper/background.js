@@ -546,7 +546,18 @@ async function resolveJobUrl(initialUrl) {
         state.fetchHits += 1;
         return { ok: true, finalUrl: cleanFinalUrl(cf.finalUrl), applyInitial: initialUrl, method: "click-fetch" };
       }
-      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "needs JS redirect"), method: "no-tab" };
+      // Fallback: the job's posting page (/p/<id>) — confirmed to load after the
+      // Sept 2026 redesign — embeds the job data, including where to apply.
+      // Pull the employer link out of its HTML the same way hiring.cafe's is.
+      const m = initialUrl.match(/\/jobs\/click\/([A-Za-z0-9-]+)/);
+      if (m && !cancelAll) {
+        const pf = await resolveHiringCafeApplyUrl("https://simplify.jobs/p/" + m[1]);
+        if (pf.ok && pf.finalUrl && !SITE_HOST_RE.test(hostOf(pf.finalUrl))) {
+          state.fetchHits += 1;
+          return { ok: true, finalUrl: cleanFinalUrl(pf.finalUrl), applyInitial: initialUrl, method: "posting-page" };
+        }
+      }
+      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "click redirect stayed on simplify; posting page had no apply link"), method: "no-tab" };
     }
 
     // Everything else — plain fetch with HTTP redirect following.
