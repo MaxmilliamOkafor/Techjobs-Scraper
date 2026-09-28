@@ -103,6 +103,17 @@
       ],
       "world": "MAIN",
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*"
+      ],
+      "js": [
+        "ch-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
     }
   ]
 }

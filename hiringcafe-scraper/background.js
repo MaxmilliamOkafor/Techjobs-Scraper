@@ -631,11 +631,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
             .catch(async () => {
               try {
-                if (/jobright\.ai$/i.test(hostOf(target.url))) {
-                  // Tab was open before the extension loaded: add the MAIN-world
-                  // API listener too (later list pages get cached; earlier ones
-                  // fall back to per-job detail fetches).
-                  await chrome.scripting.executeScript({ target: { tabId: target.id }, files: ["jobright-main.js"], world: "MAIN" }).catch(() => {});
+                // Tab was open before the extension loaded, so its MAIN-world
+                // page helper is missing too: add it alongside content.js.
+                const mainHelper = /jobright\.ai$/i.test(hostOf(target.url)) ? "jobright-main.js"
+                  : /careerhound\.io$/i.test(hostOf(target.url)) ? "ch-main.js"
+                  : /simplify\.jobs$/i.test(hostOf(target.url)) ? "sj-main.js" : null;
+                if (mainHelper) {
+                  await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [mainHelper], world: "MAIN" }).catch(() => {});
                 }
                 await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [contentScriptFor(target.url)] });
                 await chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} });

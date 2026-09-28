@@ -1160,30 +1160,36 @@ async function sjRun() {
 // =================== end simplify.jobs adapter ===================
 
 //                       careerhound.io adapter                       
-// careerhound.io renders job listings as a responsive grid of cards. Each card
-// is a <div class="[content-visibility:auto] ..."> that contains an <a target=
-// "_blank"> whose href is ALREADY the final external employer / ATS URL (Oracle
-// Cloud, Comeet, BambooHR, Taleo, Greenhouse, gov.uk, ...) — no redirect needs
-// resolving. All fields (title, company, work mode, commitment, salary,
-// posted age, description) are visible directly on the card, so we read them in
-// place without opening any detail view. Pagination is a classic Prev/Next pager
-// with a button[aria-label="Next page"]; cards fully replace on each page.
+// Current layout: each job is <article data-testid="job-card" data-job-id="…">,
+// title in the card's <h3>. No <a> links: the title and "Apply" are <button>s,
+// so the employer URL is not in the markup — ch-main.js (MAIN world) gets it
+// from the page (attributes, the job's React data, or a suppressed Apply press)
+// and answers by job id. The company is blurred when signed out; blurred text is
+// left blank rather than exported as placeholder. The grid only draws part of
+// the list, so we scroll in steps and collect by job id. A Next-page button, if
+// one appears, is followed after scrolling stops producing new jobs.
+// The previous layout (div.[content-visibility:auto] cards with an external
+// <a> Apply link) is still accepted as a fallback.
 function chIsTarget() {
   return /(^|\.)careerhound\.io$/i.test(location.hostname);
 }
 const CH_MODE_VALUES = new Set(["on-site", "onsite", "remote", "hybrid", "in-person", "in person", "field"]);
 const CH_COMMIT_VALUES = new Set(["full time", "part time", "contract", "internship", "temporary", "full-time", "part-time"]);
-const CH_SALARY_RE = /[\u20ac\u00a3$]\s?\d/;
+const CH_SALARY_RE = /[€£$]\s?\d/;
 const CH_AGE_RE = /^\d+\s*[smhdw]$/i;
+const CH_CARD_SEL = 'article[data-testid="job-card"]';
 function chGetCards() {
+  const cards = Array.from(document.querySelectorAll(CH_CARD_SEL)).filter(isVisible);
+  if (cards.length) return cards;
   return Array.from(document.querySelectorAll('div.\\[content-visibility\\:auto\\]'))
-    // Accept any card carrying a link — not only target="_blank" — so a card
-    // whose Apply control renders differently is still picked up.
     .filter((c) => c.querySelector('a[href]'))
     .filter(isVisible);
 }
+function chIdOf(card) {
+  return (card.dataset && card.dataset.jobId) || card.getAttribute("data-job-id") || "";
+}
 function chCardTitle(card) {
-  const h = card.querySelector("h1,h2,h3,h4,h5,h6");
+  const h = card.querySelector("h3") || card.querySelector("h1,h2,h4,h5,h6");
   if (h) return visibleText(h);
   const links = Array.from(card.querySelectorAll('a[href]'));
   const nonApply = links.find((a) => {
@@ -1192,21 +1198,33 @@ function chCardTitle(card) {
   });
   return nonApply ? visibleText(nonApply) : "";
 }
+// Company text is blurred (CSS filter) when signed out: that text is a
+// placeholder, not the company, so it must not be exported.
+function chIsBlurred(el, card) {
+  for (let n = el; n && n !== card.parentElement; n = n.parentElement) {
+    if (n.nodeType !== 1) continue;
+    if (/blur\(/.test(getComputedStyle(n).filter || "")) return true;
+    if (/(^|\s)blur(-\w+)?(\s|$)/.test((n.className || "").toString())) return true;
+  }
+  return false;
+}
 function chCardCompany(card, title) {
   const walker = document.createTreeWalker(card, NodeFilter.SHOW_TEXT);
   const texts = [];
   let n;
   while ((n = walker.nextNode())) {
     const v = (n.textContent || "").replace(/\s+/g, " ").trim();
-    if (v) texts.push(v);
+    if (!v) continue;
+    texts.push({ v, blurred: chIsBlurred(n.parentElement, card), inButton: !!(n.parentElement && n.parentElement.closest("button")) });
   }
-  let ti = texts.findIndex((t) => t === title || (title && title.startsWith(t)));
+  let ti = texts.findIndex((t) => t.v === title || (title && title.startsWith(t.v)));
   if (ti < 0) ti = 0;
   for (let i = ti + 1; i < texts.length; i++) {
-    const t = texts[i], lc = t.toLowerCase();
-    if (CH_MODE_VALUES.has(lc) || CH_COMMIT_VALUES.has(lc) || CH_SALARY_RE.test(t) ||
-        CH_AGE_RE.test(t) || /^apply$/i.test(t) || /more from this company/i.test(t)) continue;
-    return t;
+    const { v, blurred, inButton } = texts[i], lc = v.toLowerCase();
+    if (CH_MODE_VALUES.has(lc) || CH_COMMIT_VALUES.has(lc) || CH_SALARY_RE.test(v) ||
+        CH_AGE_RE.test(v) || /^apply\b/i.test(v) || /more from this company/i.test(v)) continue;
+    if (inButton && v !== title) continue;
+    return blurred ? "" : v;        // first text after the title is the company slot
   }
   return "";
 }
@@ -1214,14 +1232,13 @@ function chCardDescription(card) {
   const leaves = Array.from(card.querySelectorAll("p, div, span")).filter((e) => e.children.length <= 1);
   let best = "";
   for (const el of leaves) {
+    if (chIsBlurred(el, card)) continue;
     const t = visibleText(el);
     if (t.length > best.length && !/more from this company/i.test(t)) best = t;
   }
   return best;
 }
-// The job URL lives on the card's "Apply" control. Resolve it defensively:
-// never return an internal careerhound.io link (e.g. "More from this company"),
-// because the exported Job URL column must only ever hold the external ATS URL.
+// Previous layout only: an external <a> Apply link right on the card.
 function chApplyUrl(card) {
   const isExternal = (a) => {
     if (!a || !a.href || !/^https?:/i.test(a.href)) return false;
@@ -1229,28 +1246,18 @@ function chApplyUrl(card) {
     catch (_) { return false; }
   };
   const anchors = Array.from(card.querySelectorAll("a"));
-  // 1) The anchor labelled "Apply" (tolerates "Apply now", trailing icon text).
   const apply = anchors.find((a) => /^apply\b/i.test(visibleText(a)) && isExternal(a));
   if (apply) return apply.href;
-  // 2) Any other external anchor, skipping the internal "More from this company".
   const ext = anchors.find((a) => isExternal(a) && !/more from this company/i.test(visibleText(a)));
-  if (ext) return ext.href;
-  // 3) Apply rendered as a <button> — check common data-* attributes.
-  for (const b of card.querySelectorAll("button, [role='button']")) {
-    if (!/^apply\b/i.test(visibleText(b))) continue;
-    for (const k of ["data-url", "data-href", "data-apply-url", "data-link"]) {
-      const v = b.getAttribute(k);
-      if (v && /^https?:/i.test(v)) {
-        try { if (!/(^|\.)careerhound\.io$/i.test(new URL(v).host)) return v; } catch (_) {}
-      }
-    }
-  }
-  return "";
+  return ext ? ext.href : "";
 }
 function chBuildRow(card) {
-  const url = chApplyUrl(card);
   const title = chCardTitle(card);
-  const chips = Array.from(card.querySelectorAll("span, div, button")).map(visibleText).filter(Boolean);
+  // Leaf elements only: a wrapper's combined text ("RemoteFull Time$120K1h")
+  // would otherwise match the salary pattern before the real salary chip.
+  const chips = Array.from(card.querySelectorAll("span, div, button, p, li"))
+    .filter((el) => el.children.length === 0 && !chIsBlurred(el, card))
+    .map(visibleText).filter(Boolean);
   let work_mode = "", commitment = "", salary = "", posted_age = "";
   for (const c of chips) {
     const lc = c.toLowerCase();
@@ -1259,88 +1266,138 @@ function chBuildRow(card) {
     else if (!salary && CH_SALARY_RE.test(c) && c.length < 40) salary = c;
     else if (!posted_age && CH_AGE_RE.test(c)) posted_age = c;
   }
+  const url = chApplyUrl(card);
   return {
-    url: url,
-    title: title,
+    url,
+    title,
     company: chCardCompany(card, title),
     location: "",
-    salary: salary,
-    work_mode: work_mode,
-    commitment: commitment,
+    salary, work_mode, commitment,
     yoe: "",
-    posted_age: posted_age,
+    posted_age,
     description: chCardDescription(card),
     skills: "",
     job_posting_initial_url: url,
     hiringcafe_viewall_url: location.href,
-    status: url ? "ok" : "no apply url found",
-    method: "apply-href",
+    status: url ? "ok" : "pending",
+    method: url ? "apply-href" : "",
     scraped_at: new Date().toISOString()
   };
+}
+// Ask ch-main.js for the employer URL of each job id (cards must be mounted).
+function chRequestUrls(ids) {
+  return new Promise((resolve) => {
+    if (!ids.length) { resolve({}); return; }
+    const nonce = "ch" + Date.now() + ":" + Math.random();
+    function onMsg(e) {
+      if (e.source !== window || !e.data || e.data.__tjsChRes !== nonce) return;
+      window.removeEventListener("message", onMsg);
+      resolve(e.data.results || {});
+    }
+    window.addEventListener("message", onMsg);
+    window.postMessage({ __tjsChReq: nonce, ids, allowClick: true }, "*");
+    // Worst case each id needs a ~2.5s suppressed Apply press.
+    setTimeout(() => { window.removeEventListener("message", onMsg); resolve({}); }, 4000 + ids.length * 3000);
+  });
+}
+function chScroller() {
+  const card = chGetCards()[0];
+  let n = card ? card.parentElement : null;
+  while (n && n !== document.body && n !== document.documentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if (/(auto|scroll|overlay)/.test(oy) && n.scrollHeight > n.clientHeight + 20) return n;
+    n = n.parentElement;
+  }
+  return document.scrollingElement || document.documentElement;
 }
 function chGetPagination() {
   return {
     next: document.querySelector('button[aria-label="Next page"], a[aria-label="Next page"]'),
-    current: (() => {
-      const nodes = Array.from(document.querySelectorAll("*"));
-      const p = nodes.find((e) => /^Page\s+\d+$/.test(visibleText(e)) && e.children.length === 0);
-      const m = p ? visibleText(p).match(/(\d+)/) : null;
-      return m ? parseInt(m[1], 10) : null;
-    })(),
+    current: null,
     total: null
   };
 }
-async function chWaitForCardChange(prevFirstTitle) {
-  const start = Date.now();
-  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS) {
-    if (aborted) return false;
-    await sleep(150);
-    const cards = chGetCards();
-    const first = cards[0];
-    const t = first ? chCardTitle(first) : "";
-    if (t && t !== prevFirstTitle) return true;
-  }
-  return false;
-}
-async function chScrapePage(pageIndex, totalPages) {
-  const cards = chGetCards();
-  await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: 0, status: "running" });
-  let completed = 0;
-  for (let i = 0; i < cards.length; i++) {
+async function chProcess(cards, pageIndex, counter) {
+  const rows = new Map();
+  for (const card of cards) rows.set(card, chBuildRow(card));
+  // Everything without a direct link goes to ch-main by job id, while mounted.
+  const need = cards.filter((c) => !rows.get(c).url && chIdOf(c));
+  const answers = await chRequestUrls(need.map(chIdOf));
+  await Promise.all(cards.map(async (card) => {
     if (aborted) return;
-    const card = cards[i];
-    try { card.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
-    const row = chBuildRow(card);
+    const row = rows.get(card);
+    const a = answers[chIdOf(card)];
+    if (!row.url && a) {
+      if (a.url && isResolvedExternalUrl(a.url)) {
+        row.url = a.url; row.job_posting_initial_url = a.url; row.status = "ok"; row.method = a.how;
+      } else if (a.internal) {
+        // A Career Hound redirect link: let the background worker follow it.
+        row.job_posting_initial_url = a.internal;
+        const resp = await send("RESOLVE_URL", { url: a.internal });
+        if (resp && resp.ok && isResolvedExternalUrl(resp.finalUrl)) {
+          row.url = resp.finalUrl; row.status = "ok"; row.method = a.how + "+" + (resp.method || "fetch");
+        } else row.status = "unresolved: " + ((resp && resp.error) || "redirect stayed on careerhound.io");
+      } else row.status = "no apply url: " + (a.how || "unknown");
+    } else if (!row.url) row.status = "no apply url: page helper did not answer (reload the tab)";
     await send("JOB_SCRAPED", { row });
-    completed += 1;
-    if (completed % 4 === 0 || completed === cards.length)
-      await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: completed, status: "running" });
-  }
+    counter.n += 1;
+    if (counter.n % 4 === 0) await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: counter.n, status: "running" });
+  }));
 }
 async function chRun(options) {
   options = options || {};
   aborted = false;
+  // Wait for the grid (it renders client-side after load).
+  const start = Date.now();
+  while (Date.now() - start < 20000 && !chGetCards().length && !aborted) await sleep(200);
   if (!chGetCards().length) {
-    const start = Date.now();
-    while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !chGetCards().length) await sleep(150);
+    await send("SCRAPE_DONE", { error: 'No job cards found on careerhound.io (looked for article[data-testid="job-card"]). Wait for results to show, then try again.' });
+    return;
   }
-  if (!chGetCards().length) { await send("SCRAPE_DONE", { error: "No job cards found on careerhound.io page." }); return; }
-  let guard = 0;
+  const keyOf = (c) => chIdOf(c) || (chCardTitle(c) + "|" + chApplyUrl(c));
+  const seen = new Set();
+  const counter = { n: 0 };
+  let pageIndex = 1, noNew = 0;
+  let scroller = chScroller();
+  // The grid draws progressively; start from the top so nothing above is skipped.
+  scroller.scrollTop = 0; await sleep(300);
   while (!aborted) {
-    guard += 1;
-    const pag = chGetPagination();
-    const pageIndex = pag.current || guard;
-    const cards = chGetCards();
-    const prevFirstTitle = cards[0] ? chCardTitle(cards[0]) : "";
-    await chScrapePage(pageIndex, pag.total);
-    if (aborted) break;
-    let next = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
-    if (!next) next = chGetPagination().next;
-    if (!next || next.disabled || next.getAttribute("aria-disabled") === "true") break;
-    clickAt(next);
-    await sleep(POST_CLICK_GRACE_MS);
-    const changed = await chWaitForCardChange(prevFirstTitle);
-    if (!changed) break;
+    const fresh = chGetCards().filter((c) => { const k = keyOf(c); return k && !seen.has(k); });
+    if (fresh.length) {
+      noNew = 0;
+      fresh.forEach((c) => seen.add(keyOf(c)));
+      await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: counter.n, status: "running" });
+      await chProcess(fresh, pageIndex, counter);
+      if (aborted) break;
+    }
+
+    // Step, don't jump: a partially drawn grid only mounts what's near the view.
+    const before = scroller.scrollTop;
+    scroller.scrollTop = before + Math.max(300, Math.floor((scroller.clientHeight || window.innerHeight) * 0.8));
+    try { scroller.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (_) {}
+    if (scroller === document.scrollingElement) window.dispatchEvent(new Event("scroll"));
+    await sleep(500);
+    // Still moving through drawn cards: not a sign the list is exhausted. Only
+    // count a "no new jobs" round once the scroller can go no further.
+    const moved = Math.abs(scroller.scrollTop - before) > 2;
+    if (fresh.length || moved) { noNew = 0; continue; }
+    noNew += 1;
+
+    if (noNew >= 4) {
+      // Scrolling has stopped producing jobs. Follow a Next-page button if any.
+      let next = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
+      if (!next) next = chGetPagination().next;
+      if (!next || next.disabled || next.getAttribute("aria-disabled") === "true") break;
+      clickAt(next);
+      await sleep(POST_CLICK_GRACE_MS);
+      const t0 = Date.now();
+      while (Date.now() - t0 < PAGE_RENDER_TIMEOUT_MS && !aborted &&
+             !chGetCards().some((c) => !seen.has(keyOf(c)))) await sleep(200);
+      if (!chGetCards().some((c) => !seen.has(keyOf(c)))) break;
+      pageIndex += 1; noNew = 0;
+      scroller = chScroller(); scroller.scrollTop = 0;
+      continue;
+    }
   }
   await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
 }
