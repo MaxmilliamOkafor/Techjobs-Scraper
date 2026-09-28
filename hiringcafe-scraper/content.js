@@ -964,29 +964,16 @@ const SJ_NO_GROWTH_TRIES = 5;
 function sjIsTarget() {
   return /(^|\.)simplify\.jobs$/i.test(location.hostname);
 }
-// Card lookup with progressive fallbacks, mirroring sj-main.js, so a testid or
-// class rename on simplify.jobs can't reduce this to zero cards.
-const SJ_CARD_SELECTORS = [
-  '[data-testid="job-card"]',
-  '[data-testid*="job-card" i]',
-  '[data-testid*="jobcard" i]',
-  '[data-testid*="job" i]',
-  'a[href*="job="]',
-  'a[href*="/jobs/"]'
-];
+// Job cards. sj-main.js (MAIN world) identifies them from their React data and
+// tags each with data-tjs-sj="<id>" — the current layout has no testid, link or
+// id in the markup, so this isolated script cannot recognise a card any other
+// way. The old [data-testid="job-card"] layout is still accepted.
 function sjGetCardButtons() {
-  for (const sel of SJ_CARD_SELECTORS) {
-    let els;
-    try { els = Array.from(document.querySelectorAll(sel)); } catch (_) { continue; }
-    if (!els.length) continue;
-    const out = [], seen = new Set();
-    for (const e of els) {
-      const c = e.closest("button, article, li, a") || e;
-      if (!seen.has(c) && isVisible(c)) { seen.add(c); out.push(c); }
-    }
-    if (out.length) return out;
-  }
-  return [];
+  const tagged = Array.from(document.querySelectorAll("[data-tjs-sj]")).filter(isVisible);
+  if (tagged.length) return tagged;
+  return Array.from(document.querySelectorAll('[data-testid="job-card"]'))
+    .map((c) => c.closest("button") || c)
+    .filter(isVisible);
 }
 let sjLastProbe = null;
 function sjRequestRows() {
@@ -1000,7 +987,7 @@ function sjRequestRows() {
     }
     window.addEventListener("message", onMsg);
     window.postMessage({ __sjReq: nonce }, "*");
-    setTimeout(() => { window.removeEventListener("message", onMsg); resolve([]); }, 3000);
+    setTimeout(() => { window.removeEventListener("message", onMsg); resolve([]); }, 5000);
   });
 }
 function sjCurrencySym(c) { return c === "USD" ? "$" : c === "GBP" ? "£" : c === "EUR" ? "€" : (c ? c + " " : ""); }
@@ -1011,6 +998,20 @@ function sjSalary(r) {
   let s = (r.min_salary && r.max_salary) ? (fmt(r.min_salary) + " - " + fmt(r.max_salary)) : fmt(r.min_salary || r.max_salary);
   if (r.salary_period === 4) s += " /yr";
   return s;
+}
+// Last-updated time -> the short age the other sites export ("5h", "3d").
+// Accepts epoch seconds, epoch ms or a date string; anything else passes through.
+function sjAge(v) {
+  if (v == null || v === "") return "";
+  let t;
+  if (typeof v === "number") t = v < 1e12 ? v * 1000 : v;
+  else if (/^\d+$/.test(String(v))) { const n = Number(v); t = n < 1e12 ? n * 1000 : n; }
+  else t = Date.parse(v);
+  if (!Number.isFinite(t)) return String(v);
+  const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+  if (mins < 60) return mins + "m";
+  if (mins < 60 * 24) return Math.round(mins / 60) + "h";
+  return Math.round(mins / (60 * 24)) + "d";
 }
 function sjBuildRow(r) {
   const id = r.id || "";
@@ -1028,23 +1029,29 @@ function sjBuildRow(r) {
     work_mode: r.travel || "",
     commitment: r.type || "",
     yoe: (r.experience || []).filter(Boolean).join(" | "),
-    posted_age: "",
+    posted_age: sjAge(r.updated),
     description: (r.functions || []).filter(Boolean).join(" | "),
     skills: (r.majors || []).filter(Boolean).join(" | "),
     job_posting_initial_url: clickUrl,
-    // simplify.jobs moved job routing to /search?job=<uuid> (was /jobs?jobId=).
-    hiringcafe_viewall_url: id ? (location.origin + "/search?job=" + id) : location.href,
+    // The results page selects a job with ?job=<uuid>.
+    hiringcafe_viewall_url: id ? (location.origin + location.pathname + "?job=" + id) : location.href,
     status: direct ? "ok" : (clickUrl ? "pending" : "no job posting url on card"),
     method: direct ? "hit-apply-url" : "",
     scraped_at: new Date().toISOString()
   };
 }
+// The results list scrolls inside its own container. Find it from a job card
+// (nearest scrollable ancestor) rather than from class names, which are
+// generated and change between builds.
 function sjGetScroller() {
-  return Array.from(document.querySelectorAll("*")).find(
-    (el) => el.scrollHeight > el.clientHeight + 20
-      && el.querySelector && el.querySelector('[data-testid="job-card"]')
-      && /overflow-y-auto/.test((el.className || "").toString())
-  ) || null;
+  const card = sjGetCardButtons()[0];
+  let n = card ? card.parentElement : null;
+  while (n && n !== document.body && n !== document.documentElement) {
+    const oy = getComputedStyle(n).overflowY;
+    if (/(auto|scroll|overlay)/.test(oy) && n.scrollHeight > n.clientHeight + 20) return n;
+    n = n.parentElement;
+  }
+  return null;
 }
 function sjScrollToLoadMore() {
   const scroller = sjGetScroller();
@@ -1060,30 +1067,48 @@ function sjScrollToLoadMore() {
     window.dispatchEvent(new Event("scroll", { bubbles: true }));
   }
 }
+// Best-effort close of the "Simplify+" upsell dialog, which sits over the list.
+// Only a dialog that mentions Simplify+ is touched, and only its close control.
+function sjDismissUpsell() {
+  for (const d of document.querySelectorAll('[role="dialog"], [aria-modal="true"]')) {
+    if (!/simplify\s*(\+|plus)/i.test(d.innerText || "")) continue;
+    const btn = Array.from(d.querySelectorAll('button, [role="button"]')).find((b) => {
+      const label = ((b.getAttribute("aria-label") || "") + " " + (b.innerText || "")).trim();
+      return /close|dismiss|no thanks|maybe later|not now|^×$|^x$/i.test(label);
+    });
+    if (btn) { try { btn.click(); } catch (_) {} return true; }
+  }
+  return false;
+}
 async function sjRun() {
   aborted = false;
+  sjDismissUpsell();
+
+  // Wait for the list: ask sj-main for rows until some arrive. Cards cannot be
+  // detected here before sj-main has tagged them, so rows are the readiness
+  // signal, not a DOM selector.
+  let first = [];
   const start = Date.now();
-  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !sjGetCardButtons().length) await sleep(150);
-  if (!sjGetCardButtons().length) { await send("SCRAPE_DONE", { error: "No job cards found on simplify.jobs — the page markup may have changed." }); return; }
+  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !aborted) {
+    first = await sjRequestRows();
+    if (first.length) break;
+    sjDismissUpsell();
+    await sleep(400);
+  }
+  if (!first.length) {
+    const p = sjLastProbe || {};
+    await send("SCRAPE_DONE", {
+      error: "simplify.jobs: no jobs found. Scanned " + (p.liScanned ?? "?") + " list item(s); " +
+             (p.cardEls ?? 0) + " carried job data. Close any Simplify+ popup, make sure results are " +
+             "showing, reload the tab once (so the page helper loads), then try again."
+    });
+    return;
+  }
 
   const seen = new Set();
-  let pageIndex = 0, noGrowth = 0, everGotRows = false;
+  let pageIndex = 0, noGrowth = 0, rawRows = first;
   while (!aborted) {
     pageIndex += 1;
-    const rawRows = await sjRequestRows();
-    // Cards are on screen but the MAIN-world fiber read returned nothing: report
-    // exactly where it broke instead of finishing with an empty, silent export.
-    if (!rawRows.length && !everGotRows) {
-      const p = sjLastProbe || {};
-      if (p.cardEls === 0 || p.withFiber === 0) {
-        await send("SCRAPE_DONE", {
-          error: "simplify.jobs: found " + (p.cardEls ?? "?") + " card element(s) but read job data from " +
-                 (p.withFiber ?? "?") + " of them — their page structure changed. Send the card HTML to fix the selectors."
-        });
-        return;
-      }
-    }
-    if (rawRows.length) everGotRows = true;
     const newRows = [];
     for (const r of rawRows) {
       if (r.id && seen.has(r.id)) continue;
@@ -1115,14 +1140,17 @@ async function sjRun() {
     }));
     if (aborted) break;
 
-    const before = sjGetCardButtons().length;
-    sjScrollToLoadMore();
-    await sleep(SJ_SCROLL_PAUSE_MS);
-
-    if (sjGetCardButtons().length <= before) {
+    // Stop on "no NEW job ids", not "no new elements": a list that recycles its
+    // elements keeps the card count flat while the jobs underneath change.
+    if (newRows.length === 0) {
       noGrowth += 1;
       if (noGrowth >= SJ_NO_GROWTH_TRIES) { await send("SCRAPE_DONE", {}); return; }
     } else noGrowth = 0;
+
+    sjDismissUpsell();
+    sjScrollToLoadMore();
+    await sleep(SJ_SCROLL_PAUSE_MS);
+    rawRows = await sjRequestRows();
   }
   await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
 }
