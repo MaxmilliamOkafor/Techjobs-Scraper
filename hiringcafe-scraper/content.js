@@ -26,7 +26,7 @@
   // Aggregator hosts that must NEVER survive into the exported "Job URL" column —
   // a real ATS link (greenhouse/lever/workday/etc.) is the only acceptable value.
   // If resolution returns one of these (or fails), the URL is treated as unresolved.
-  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|jobright\.ai)$/i;
+  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|jobright\.ai)$/i;
   function isResolvedExternalUrl(u) {
     if (!u || !/^https?:\/\//i.test(u)) return false;
     try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
@@ -885,6 +885,36 @@ async function ettWaitForCardChange(prevFirstTitle, columnSpec) {
   }
   return false;
 }
+// EuroTopTech moved job details and apply links behind a membership. Signed
+// out, opening a card shows a membership prompt, not the job: no "Apply Now"
+// link and no "Close job details" button. Recognise that and stop, rather than
+// exporting a blank row per card while fighting a dialog we cannot close.
+let ettPaywalled = false;
+function ettIsPaywall(dlg) {
+  if (!dlg) return false;
+  const hasApply = Array.from(dlg.querySelectorAll("a"))
+    .some((a) => /apply now/i.test(visibleText(a)) && /^https?:/i.test(a.href || ""));
+  if (hasApply) return false;
+  return /member|membership|subscri|upgrade|premium|unlock|sign ?up|log ?in|join|pricing|trial/i.test(visibleText(dlg));
+}
+function ettDismissPaywall(dlg) {
+  const btn = Array.from(dlg.querySelectorAll('button, [role="button"], a')).find((b) =>
+    /maybe later|not now|no thanks|close|dismiss/i.test(((b.getAttribute && b.getAttribute("aria-label")) || "") + " " + visibleText(b)));
+  if (btn) { try { btn.click(); } catch (_) {} }
+  else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+}
+async function ettWaitDialogOrPaywall() {
+  const start = Date.now();
+  while (Date.now() - start < ETT_OPEN_DIALOG_TIMEOUT_MS) {
+    if (aborted) return {};
+    const dlg = ettGetDialog();
+    if (dlg) return { dlg };
+    const any = document.querySelector('[role="dialog"]');
+    if (any && ettIsPaywall(any)) return { paywall: any };
+    await sleep(50);
+  }
+  return {};
+}
 async function ettScrapePage(pageIndex, totalPages, columnSpec) {
   const cards = ettGetCards(columnSpec);
   await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: 0, status: "running" });
@@ -895,7 +925,12 @@ async function ettScrapePage(pageIndex, totalPages, columnSpec) {
     try { card.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
     const clickTarget = card.querySelector(".MuiCardActionArea-root") || card;
     clickAt(clickTarget);
-    const dlg = await ettWaitDialog();
+    // Wait for EITHER the job-details dialog or a membership prompt: the
+    // details wait only recognises a dialog with an "Apply Now" link, which a
+    // membership prompt never has.
+    const opened = await ettWaitDialogOrPaywall();
+    if (opened.paywall) { ettDismissPaywall(opened.paywall); ettPaywalled = true; return; }
+    const dlg = opened.dlg;
     if (dlg) {
       const row = ettBuildRow(dlg);
       await send("JOB_SCRAPED", { row });
@@ -920,6 +955,14 @@ async function ettRun(options) {
   options = options || {};
   const columnSpec = options.columnSpec || null;
   aborted = false;
+  ettPaywalled = false;
+  // The homepage is now a marketing page; the job list lives at /jobs.
+  const hasJobsHeader = Array.from(document.querySelectorAll("p, span, div, h1, h2, h3, h4, h5, h6"))
+    .some((e) => /(Showing|Previewing)\s[\d,]+(\sof\s[\d,]+)?\sjobs/i.test(e.textContent || ""));
+  if ((location.pathname === "/" || location.pathname === "") && !hasJobsHeader) {
+    await send("SCRAPE_DONE", { error: "This is EuroTopTech's homepage, which no longer lists jobs. Open eurotoptech.com/jobs and run again." });
+    return;
+  }
   if (!ettGetCards(columnSpec).length) {
     // wait briefly for cards to render
     const start = Date.now();
@@ -935,6 +978,10 @@ async function ettRun(options) {
     const cards = ettGetCards(columnSpec);
     const prevFirstTitle = cards[0] ? visibleText(cards[0].querySelector("h1,h2,h3,h4") || cards[0]) : "";
     await ettScrapePage(pageIndex, totalPages, columnSpec);
+    if (ettPaywalled) {
+      await send("SCRAPE_DONE", { error: "EuroTopTech now shows job details and apply links to members only: opening a job showed a membership prompt. Log in with a member account, open eurotoptech.com/jobs, and run again." });
+      return;
+    }
     if (aborted) break;
     // Honor a picked pagination button (e.g. you pointed at "Next"/"›") before
     // falling back to the auto-detected "Go to next page" control.
@@ -980,13 +1027,13 @@ function sjRequestRows() {
   return new Promise((resolve) => {
     const nonce = Date.now() + ":" + Math.random();
     function onMsg(e) {
-      if (e.source !== window || !e.data || e.data.__sjRes !== nonce) return;
+      if (e.source !== window || !e.data || e.data.__sjRes3 !== nonce) return;
       window.removeEventListener("message", onMsg);
       sjLastProbe = e.data.probe || null;
       resolve(Array.isArray(e.data.rows) ? e.data.rows : []);
     }
     window.addEventListener("message", onMsg);
-    window.postMessage({ __sjReq: nonce }, "*");
+    window.postMessage({ __sjReq3: nonce }, "*");
     setTimeout(() => { window.removeEventListener("message", onMsg); resolve([]); }, 5000);
   });
 }

@@ -5,13 +5,14 @@ const SETTINGS_KEY = "hiringcafe_settings";
 // Both supported sites — used for tab discovery and validation.
 const SITE_MATCH = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://hiringcafe.com/*", "https://*.hiringcafe.com/*",
   "https://jobright.ai/*", "https://*.jobright.ai/*",
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*"
 ];
-const ON_SITE_RE = /(hiring\.cafe|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
+const ON_SITE_RE = /(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
 
 const els = {
   diagBtn: document.getElementById("diag-btn"),

@@ -17,9 +17,13 @@
 //
 // The old layout ([data-testid="job-card"] inside a <button>) is still
 // recognised first, in case it is served to some accounts or rolled back.
+// Versioned: a tab open since before an update can still hold an OLD copy of
+// this helper, which knows only the pre-redesign layout and answers with
+// nothing. New flag and message names mean the old copy neither blocks this one
+// from installing nor answers the content script's requests.
 (() => {
-  if (window.__sjMainInjected__) return;
-  window.__sjMainInjected__ = true;
+  if (window.__sjMainV3__) return;
+  window.__sjMainV3__ = true;
 
   const TAG = "data-tjs-sj";
 
@@ -240,12 +244,12 @@
   }
 
   window.addEventListener("message", (e) => {
-    if (e.source !== window || !e.data || e.data.__sjReq == null) return;
+    if (e.source !== window || !e.data || e.data.__sjReq3 == null) return;
     try {
       const rows = extractAll();
-      window.postMessage({ __sjRes: e.data.__sjReq, rows, probe: lastProbe }, "*");
+      window.postMessage({ __sjRes3: e.data.__sjReq3, rows, probe: lastProbe }, "*");
     } catch (err) {
-      window.postMessage({ __sjRes: e.data.__sjReq, rows: [], probe: { error: String(err) } }, "*");
+      window.postMessage({ __sjRes3: e.data.__sjReq3, rows: [], probe: { error: String(err) } }, "*");
     }
   });
 })();

@@ -9,13 +9,14 @@ const RESULTS_KEY = "hiringcafe_results";
 // Sites this extension can scrape. Add new sites here to extend support.
 const SITE_MATCHES = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://hiringcafe.com/*", "https://*.hiringcafe.com/*",   // hiring.cafe now redirects here
   "https://jobright.ai/*", "https://*.jobright.ai/*",
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -25,7 +26,7 @@ const MAX_CONCURRENT_TABS = 2;
 const DETAIL_LOAD_TIMEOUT_MS = 15000;
 const DETAIL_APPLY_POLL_INTERVAL_MS = 250;
 const DETAIL_APPLY_POLL_MAX_ATTEMPTS = 60;
-const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe"]);
+const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe", "hiringcafe.com", "www.hiringcafe.com"]);
 // simplify.jobs job links are /jobs/click/{id} — an HTTP 302 to the employer
 // ATS that must be followed in a tab (the cross-origin hop isn't fetch-readable).
 const CLICK_REDIRECT_HOSTS = new Set(["simplify.jobs", "www.simplify.jobs"]);
@@ -323,7 +324,7 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
       if (!href || !/^https?:/i.test(href)) return false;
       try {
         const u = new URL(href, window.location.href);
-        return !/(^|\.)hiring\.cafe$/i.test(u.host);
+        return !/(^|\.)(hiring\.cafe|hiringcafe\.com)$/i.test(u.host);
       } catch (_) { return false; }
     }
     function check() {
@@ -593,7 +594,7 @@ async function findTargetTab(preferTabId) {
 }
 function siteLabelFor(url) {
   const h = hostOf(url);
-  if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/(hiring\.cafe|hiringcafe\.com)$/i.test(h)) return "hiring.cafe";
   if (/jobright\.ai$/i.test(h)) return "jobright.ai";
   if (/careerhound\.io$/i.test(h)) return "careerhound.io";
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
@@ -603,6 +604,15 @@ function siteLabelFor(url) {
 }
 // Which content script handles a given tab. hnhiring.com is served by its own
 // dedicated handler; all other supported sites share content.js.
+// The MAIN-world page helper each site needs (reads data only the page can see).
+function mainHelperFor(url) {
+  const h = hostOf(url);
+  if (/jobright\.ai$/i.test(h)) return "jobright-main.js";
+  if (/careerhound\.io$/i.test(h)) return "ch-main.js";
+  if (/simplify\.jobs$/i.test(h)) return "sj-main.js";
+  if (/(hiring\.cafe|hiringcafe\.com)$/i.test(h)) return "fiber-main.js";
+  return null;
+}
 function contentScriptFor(url) {
   return /hnhiring\.com$/i.test(hostOf(url)) ? "hnhiring.js" : "content.js";
 }
@@ -628,17 +638,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           state.site = siteLabelFor(target.url);
           state.fetchHits = 0; state.tabHits = 0;
           persistState();
+          // Make sure the tab's MAIN-world page helper is there BEFORE the scrape
+          // starts. Chrome only adds it when a page loads, so a tab that was open
+          // before the extension was installed or updated has none, and the
+          // scraper can read nothing. Injecting on every Start is safe: each
+          // helper ignores a second copy of itself.
+          const helper = mainHelperFor(target.url);
+          if (helper) {
+            await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [helper], world: "MAIN" })
+              .catch((e) => console.warn("page helper inject failed", e));
+          }
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
             .catch(async () => {
               try {
-                // Tab was open before the extension loaded, so its MAIN-world
-                // page helper is missing too: add it alongside content.js.
-                const mainHelper = /jobright\.ai$/i.test(hostOf(target.url)) ? "jobright-main.js"
-                  : /careerhound\.io$/i.test(hostOf(target.url)) ? "ch-main.js"
-                  : /simplify\.jobs$/i.test(hostOf(target.url)) ? "sj-main.js" : null;
-                if (mainHelper) {
-                  await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [mainHelper], world: "MAIN" }).catch(() => {});
-                }
+                // Content script missing too (tab predates the extension): add it.
                 await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [contentScriptFor(target.url)] });
                 await chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} });
               } catch (e2) {
