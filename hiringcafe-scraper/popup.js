@@ -10,9 +10,10 @@ const SITE_MATCH = [
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
-  "https://hnhiring.com/*", "https://*.hnhiring.com/*"
+  "https://hnhiring.com/*", "https://*.hnhiring.com/*",
+  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*"
 ];
-const ON_SITE_RE = /(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
+const ON_SITE_RE = /(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com\/jobs|indeed\.com)/;
 
 const els = {
   diagBtn: document.getElementById("diag-btn"),
@@ -182,7 +183,7 @@ async function startPickerMode(mode) {
   els.errorRow.hidden = true;
   const tabs = await chrome.tabs.query({ url: SITE_MATCH });
   if (!tabs.length) {
-    els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
+    els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first.";
     els.errorRow.hidden = false;
     return;
   }
@@ -224,7 +225,7 @@ els.startBtn.addEventListener("click", async () => {
   if (!onSite) {
     const tabs = await chrome.tabs.query({ url: SITE_MATCH });
     if (!tabs.length) {
-      els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
+      els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first.";
       els.errorRow.hidden = false;
       els.startBtn.disabled = false;
       return;

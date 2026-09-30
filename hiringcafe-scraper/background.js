@@ -14,9 +14,10 @@ const SITE_MATCHES = [
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
-  "https://hnhiring.com/*", "https://*.hnhiring.com/*"
+  "https://hnhiring.com/*", "https://*.hnhiring.com/*",
+  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com|indeed\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -600,6 +601,8 @@ function siteLabelFor(url) {
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
   if (/simplify\.jobs$/i.test(h)) return "simplify.jobs";
   if (/hnhiring\.com$/i.test(h)) return "hnhiring.com";
+  if (/linkedin\.com$/i.test(h)) return "linkedin.com";
+  if (/indeed\.com$/i.test(h)) return "indeed.com";
   return h || null;
 }
 // Which content script handles a given tab. hnhiring.com is served by its own
@@ -629,7 +632,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_SCRAPE": {
           const target = await findTargetTab();
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
@@ -706,7 +709,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_PICKER": {
           const target = await findTargetTab(msg.tabId);
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first." }); return; }
           try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {

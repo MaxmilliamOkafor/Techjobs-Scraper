@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Tech Jobs URL Scraper",
-  "version": "2.11.0",
-  "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, and hnhiring.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
+  "version": "2.12.0",
+  "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, linkedin.com and indeed.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
   "permissions": [
     "tabs",
     "storage",
@@ -26,6 +26,9 @@
     "https://*.jobright.ai/*",
     "https://careerhound.io/*",
     "https://*.careerhound.io/*",
+    "https://www.linkedin.com/*",
+    "https://indeed.com/*",
+    "https://*.indeed.com/*",
     "<all_urls>"
   ],
   "background": {
@@ -56,7 +59,10 @@
         "https://simplify.jobs/*",
         "https://*.simplify.jobs/*",
         "https://careerhound.io/*",
-        "https://*.careerhound.io/*"
+        "https://*.careerhound.io/*",
+        "https://www.linkedin.com/jobs/*",
+        "https://indeed.com/*",
+        "https://*.indeed.com/*"
       ],
       "js": [
         "content.js"

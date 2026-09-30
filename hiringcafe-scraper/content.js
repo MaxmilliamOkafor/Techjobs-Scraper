@@ -1712,7 +1712,311 @@ async function jrRun(options) {
 }
 // =================== end jobright.ai adapter ===================
 
+// ===================== linkedin.com adapter =====================
+// Job search (/jobs/search/…, /jobs/collections/…) lists ~25 jobs per page.
+// Each list item carries the job id (li[data-occludable-job-id] or
+// [data-job-id]). Items are "occludable": their content only renders near the
+// viewport, so each is scrolled into view before it is read. The employer URL
+// is never on the card. It comes from the job's own data — LinkedIn's jobs API,
+// else the job page — where an "Apply on company website" job carries
+// companyApplyUrl. Easy Apply jobs have no external URL and are flagged, not
+// given a LinkedIn link. Requests are paced like a person clicking through.
+const LI_PACE_MS = 700;
+function liIsTarget() {
+  return /(^|\.)linkedin\.com$/i.test(location.hostname) && /^\/jobs\b/.test(location.pathname);
+}
+function liText(el) { return ((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim(); }
+function liCards() {
+  const byId = new Map();
+  for (const el of document.querySelectorAll("[data-occludable-job-id], [data-job-id]")) {
+    const id = el.getAttribute("data-occludable-job-id") || el.getAttribute("data-job-id");
+    if (id && /^\d{6,}$/.test(id) && !byId.has(id)) byId.set(id, el);   // outermost first
+  }
+  if (!byId.size) {                       // other layouts: the job link carries the id
+    for (const a of document.querySelectorAll('a[href*="/jobs/view/"]')) {
+      const m = (a.getAttribute("href") || "").match(/\/jobs\/view\/(?:[^/?#]*-)?(\d{6,})/);
+      if (m && !byId.has(m[1])) byId.set(m[1], a.closest("li") || a);
+    }
+  }
+  return Array.from(byId, ([id, el]) => ({ id, el }));
+}
+function liCardFields(el) {
+  const link = el.querySelector('a[href*="/jobs/view/"]');
+  let title = (link && link.getAttribute("aria-label")) ||
+    liText(el.querySelector(".job-card-list__title, .job-card-container__link strong, strong")) || liText(link);
+  title = title.replace(/\s+with verification$/i, "").trim();
+  // Screen-reader duplicate ("Data Engineer Data Engineer") collapses to one.
+  const mid = Math.floor(title.length / 2);
+  if (title.length % 2 === 1 && title[mid] === " " && title.slice(0, mid) === title.slice(mid + 1)) title = title.slice(0, mid);
+  const company = liText(el.querySelector(".artdeco-entity-lockup__subtitle, .job-card-container__primary-description, .job-card-container__company-name"));
+  const location = liText(el.querySelector(".artdeco-entity-lockup__caption, .job-card-container__metadata-wrapper li, .job-card-container__metadata-item"));
+  const t = el.querySelector("time");
+  return { title, company, location, easy: /\bEasy Apply\b/i.test(liText(el)),
+           posted: t ? (liText(t) || t.getAttribute("datetime") || "") : "" };
+}
+function liCsrf() { const m = document.cookie.match(/(?:^|;\s*)JSESSIONID="?([^";]+)"?/); return m ? m[1] : ""; }
+function liDeepFind(root, test) {
+  const st = [root], seen = new Set(); let n = 0;
+  while (st.length && n++ < 20000) {
+    const o = st.pop();
+    if (!o || typeof o !== "object" || seen.has(o)) continue;
+    seen.add(o);
+    for (const k in o) { const v = o[k]; const r = test(k, v); if (r) return r; if (v && typeof v === "object") st.push(v); }
+  }
+  return null;
+}
+// LinkedIn wraps some links as /jobs/view/externalApply/<id>?url=<real>; strip tracking.
+function liUnwrap(u) {
+  try {
+    const x = new URL(u, location.origin);
+    if (/(^|\.)linkedin\.com$/i.test(x.hostname) && x.searchParams.get("url")) return liUnwrap(x.searchParams.get("url"));
+    for (const k of Array.from(x.searchParams.keys())) if (/^(utm_|trk|refId$|trackingId$|src$|source$|gh_src$)/i.test(k)) x.searchParams.delete(k);
+    return x.toString();
+  } catch (_) { return u; }
+}
+function liExternal(u) {
+  try { const h = new URL(u).hostname; return /^https?:/i.test(u) && !/(^|\.)(linkedin\.com|lnkd\.in)$/i.test(h); } catch (_) { return false; }
+}
+function liFromJson(j) {
+  const apply = liDeepFind(j, (k, v) => (k === "companyApplyUrl" && typeof v === "string") ? v : null);
+  const url = apply ? liUnwrap(apply) : "";
+  const easy = !!liDeepFind(j, (k, v) => (k === "$type" && typeof v === "string" && /OnsiteApply/.test(v)) ? true : null);
+  return { url: liExternal(url) ? url : "", easy: !url && easy };
+}
+function liFromHtml(html) {
+  const txt = html.replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+  let m = txt.match(/"companyApplyUrl"\s*:\s*"(https?:[^"]+)"/);
+  if (m) { const u = liUnwrap(m[1]); if (liExternal(u)) return { url: u, easy: false }; }
+  m = txt.match(/\/jobs\/view\/externalApply\/\d+\?[^"'\s<>]*?\burl=([^&"'\s<>]+)/);
+  if (m) { let u = m[1]; try { u = decodeURIComponent(u); } catch (_) {} u = liUnwrap(u); if (liExternal(u)) return { url: u, easy: false }; }
+  return { url: "", easy: /OnsiteApply/.test(txt) };
+}
+async function liJobApply(id) {
+  try {
+    const r = await fetch("/voyager/api/jobs/jobPostings/" + id, { credentials: "include",
+      headers: { "csrf-token": liCsrf(), "x-restli-protocol-version": "2.0.0", "accept": "application/vnd.linkedin.normalized+json+2.1" } });
+    if (r.ok) { const res = liFromJson(await r.json()); if (res.url || res.easy) return Object.assign(res, { how: "jobs-api" }); }
+  } catch (_) {}
+  try {
+    const r = await fetch("/jobs/view/" + id + "/", { credentials: "include" });
+    if (r.ok) return Object.assign(liFromHtml(await r.text()), { how: "job-page" });
+  } catch (_) {}
+  return { url: "", easy: false, how: "job data unavailable" };
+}
+function liNextButton() {
+  const b = document.querySelector('button[aria-label="View next page"], button.jobs-search-pagination__button--next');
+  if (b) return b;
+  const act = document.querySelector("li[data-test-pagination-page-btn].active, li.artdeco-pagination__indicator--number.active");
+  return (act && act.nextElementSibling && act.nextElementSibling.querySelector("button")) || null;
+}
+async function liRun(options) {
+  options = options || {};
+  aborted = false;
+  const single = location.pathname.match(/^\/jobs\/view\/(?:[^/?#]*-)?(\d{6,})/);
+  const start = Date.now();
+  while (!single && Date.now() - start < 15000 && !liCards().length && !aborted) await sleep(200);
+  if (!single && !liCards().length) {
+    await send("SCRAPE_DONE", { error: "No LinkedIn jobs found on this page. Open a LinkedIn job search (linkedin.com/jobs/search/…) with results showing, then try again." });
+    return;
+  }
+  const seen = new Set();
+  let page = 1, count = 0;
+  const emit = async (id, f, a) => {
+    const view = "https://www.linkedin.com/jobs/view/" + id + "/";
+    const easy = f.easy || (a && a.easy);
+    const url = a ? a.url : "";
+    await send("JOB_SCRAPED", { row: {
+      url, title: f.title, company: f.company, location: f.location, salary: "", work_mode: "", commitment: "",
+      yoe: "", posted_age: f.posted, description: "", skills: "",
+      job_posting_initial_url: view, hiringcafe_viewall_url: view,
+      status: url ? "ok" : easy ? "Easy Apply on LinkedIn (no external URL)" : "no external apply URL (" + ((a && a.how) || "?") + ")",
+      method: url ? ("linkedin-" + a.how) : "", scraped_at: new Date().toISOString() } });
+    count += 1;
+    if (count % 3 === 0) await send("PAGE_PROGRESS", { pageIndex: page, totalPages: null, scrapedThisPage: count, status: "running" });
+  };
+  if (single) {
+    const id = single[1];
+    const a = await liJobApply(id);
+    const h = document.querySelector("h1");
+    await emit(id, { title: liText(h), company: "", location: "", easy: false, posted: "" }, a);
+    await send("SCRAPE_DONE", {});
+    return;
+  }
+  while (!aborted) {
+    const fresh = liCards().filter((c) => !seen.has(c.id));
+    for (const { id } of fresh) {
+      if (aborted) break;
+      seen.add(id);
+      let el = (liCards().find((c) => c.id === id) || {}).el;
+      if (!el) continue;
+      try { el.scrollIntoView({ block: "center" }); } catch (_) {}
+      await sleep(300);                                   // let an occluded item render
+      el = (liCards().find((c) => c.id === id) || {}).el || el;
+      const f = liCardFields(el);
+      let a = null;
+      if (!f.easy) {                                      // Easy Apply: nothing external to fetch
+        a = await liJobApply(id);
+        await sleep(LI_PACE_MS + Math.round(Math.random() * 500));
+      }
+      await emit(id, f, a);
+    }
+    if (aborted) break;
+    // Next page: the list is replaced in place (no page load).
+    let next = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
+    if (!next) next = liNextButton();
+    if (!next || next.disabled || next.getAttribute("aria-disabled") === "true") break;
+    const before = (liCards()[0] || {}).id;
+    clickAt(next);
+    const t0 = Date.now();
+    while (Date.now() - t0 < 15000 && !aborted) {
+      await sleep(300);
+      const first = (liCards()[0] || {}).id;
+      if (first && first !== before && liCards().some((c) => !seen.has(c.id))) break;
+    }
+    if (!liCards().some((c) => !seen.has(c.id))) break;
+    page += 1;
+  }
+  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+}
+// =================== end linkedin.com adapter ===================
+
+// ===================== indeed.com adapter =====================
+// Search results (/jobs?q=…) on any Indeed country site (uk., ie., de. …).
+// Each card is keyed by its job key (data-jk). The page also embeds the whole
+// results list as JSON (mosaic-provider-jobcards), which is read first; the
+// DOM is the fallback. "Easily apply" jobs are applied to on Indeed, so they
+// have no employer URL and are flagged. For the rest, the job page's "Apply on
+// company site" link — an Indeed redirect — is followed by the background
+// worker to the employer. Indeed's Next page reloads the tab, which would end
+// this script, so later pages are fetched here instead. Paced; stops cleanly if
+// Indeed shows a human check.
+const IN_JOB_PACE_MS = 600, IN_PAGE_PACE_MS = 1500, IN_MAX_PAGES = 30;
+function inIsTarget() { return /(^|\.)indeed\.com$/i.test(location.hostname); }
+function inIsIndeed(u) { try { return /(^|\.)indeed\.com$/i.test(new URL(u).hostname); } catch (_) { return false; } }
+function inMosaic(doc) {
+  for (const s of doc.querySelectorAll("script")) {
+    const t = s.textContent || "";
+    const i = t.indexOf('mosaic-provider-jobcards"]=');
+    if (i < 0) continue;
+    const from = t.indexOf("{", i);
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let k = from; k < t.length; k++) {
+      const c = t[k];
+      if (inStr) { if (esc) esc = false; else if (c === "\\") esc = true; else if (c === '"') inStr = false; continue; }
+      if (c === '"') { inStr = true; continue; }
+      if (c === "{") depth++;
+      else if (c === "}" && --depth === 0) { end = k; break; }
+    }
+    if (end < 0) continue;
+    try {
+      const res = JSON.parse(t.slice(from, end + 1)).metaData.mosaicProviderJobCardsModel.results;
+      if (Array.isArray(res)) return res;
+    } catch (_) {}
+  }
+  return null;
+}
+function inJobs(doc) {
+  const m = inMosaic(doc);
+  if (m && m.length) return m.filter((r) => r && r.jobkey).map((r) => ({
+    jobkey: r.jobkey, title: r.displayTitle || r.title || "", company: r.company || r.truncatedCompany || "",
+    location: r.formattedLocation || "", salary: (r.salarySnippet && r.salarySnippet.text) || "",
+    easy: !!r.indeedApplyEnabled, posted: r.formattedRelativeTime || "", direct: r.thirdPartyApplyUrl || "" }));
+  const out = new Map();
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  for (const a of doc.querySelectorAll("[data-jk]")) {
+    const jk = a.getAttribute("data-jk");
+    if (!jk || out.has(jk)) continue;
+    const card = a.closest(".job_seen_beacon, .cardOutline, li") || a;
+    out.set(jk, { jobkey: jk,
+      title: t(card.querySelector("h2.jobTitle span[title], h2 a span")) || t(a),
+      company: t(card.querySelector('[data-testid="company-name"], .companyName')),
+      location: t(card.querySelector('[data-testid="text-location"], .companyLocation')),
+      salary: t(card.querySelector('.salary-snippet-container, [data-testid="salary-snippet"]')),
+      easy: !!card.querySelector('[data-testid="indeedApply"], .iaLabel') || /easily apply/i.test(t(card)),
+      posted: t(card.querySelector('[data-testid="myJobsStateDate"], .date')), direct: "" });
+  }
+  return Array.from(out.values());
+}
+function inNextHref(doc, pageUrl) {
+  const a = doc.querySelector('a[data-testid="pagination-page-next"], a[aria-label="Next Page"], a[aria-label="Next"]');
+  const h = a && a.getAttribute("href");
+  try { return h ? new URL(h, pageUrl).href : ""; } catch (_) { return ""; }
+}
+function inIsHumanCheck(html) { return /captcha|cf-challenge|Just a moment|verify you are human/i.test(html) && !/data-jk|jobkey/.test(html); }
+let inBlocked = false;
+async function inExternalUrl(job) {
+  if (job.direct && /^https?:/i.test(job.direct) && !inIsIndeed(job.direct)) return { url: job.direct, how: "list-data" };
+  let hop = job.direct && inIsIndeed(job.direct) ? job.direct : "";
+  if (!hop) {
+    let html = "";
+    try { html = await (await fetch("/viewjob?jk=" + encodeURIComponent(job.jobkey), { credentials: "include" })).text(); } catch (_) {}
+    if (inIsHumanCheck(html)) { inBlocked = true; return { url: "", how: "Indeed asked for a human check" }; }
+    const txt = html.replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
+    const d = txt.match(/"(?:companyApplyUrl|externalApplyUrl|thirdPartyApplyUrl)"\s*:\s*"(https?:[^"]+)"/);
+    if (d && !inIsIndeed(d[1])) return { url: d[1], how: "job-page" };
+    const r = txt.match(/https?:\/\/[a-z.]*indeed\.com\/(?:applystart|rc\/clk)[^"'\s<>\\]*/i) || txt.match(/\/(?:applystart|rc\/clk)\?[^"'\s<>\\]*/i);
+    if (r) hop = new URL(r[0], location.origin).href;
+    else if (d) hop = d[1];
+  }
+  if (!hop) return { url: "", how: "no company-site apply link on the job page" };
+  const resp = await send("RESOLVE_URL", { url: hop });
+  if (resp && resp.ok && resp.finalUrl && !inIsIndeed(resp.finalUrl) && isResolvedExternalUrl(resp.finalUrl)) return { url: resp.finalUrl, how: "apply-redirect" };
+  return { url: "", how: "apply redirect stayed on Indeed" + (resp && resp.error ? " (" + resp.error + ")" : "") };
+}
+async function inRun(options) {
+  aborted = false; inBlocked = false;
+  const start = Date.now();
+  while (Date.now() - start < 15000 && !inJobs(document).length && !aborted) await sleep(250);
+  if (!inJobs(document).length) {
+    await send("SCRAPE_DONE", { error: "No Indeed jobs found on this page. Open an Indeed job search (indeed.com/jobs?q=…) with results showing, then try again." });
+    return;
+  }
+  const seen = new Set();
+  let doc = document, pageUrl = location.href, page = 1, count = 0;
+  while (!aborted && page <= IN_MAX_PAGES) {
+    for (const j of inJobs(doc)) {
+      if (aborted || inBlocked) break;
+      if (seen.has(j.jobkey)) continue;
+      seen.add(j.jobkey);
+      let a = null;
+      if (!j.easy) { a = await inExternalUrl(j); await sleep(IN_JOB_PACE_MS + Math.round(Math.random() * 400)); }
+      const view = location.origin + "/viewjob?jk=" + j.jobkey;
+      await send("JOB_SCRAPED", { row: {
+        url: a ? a.url : "", title: j.title, company: j.company, location: j.location, salary: j.salary,
+        work_mode: "", commitment: "", yoe: "", posted_age: j.posted, description: "", skills: "",
+        job_posting_initial_url: view, hiringcafe_viewall_url: view,
+        status: a && a.url ? "ok" : j.easy ? "Easily apply on Indeed (no external URL)" : "no external apply URL (" + ((a && a.how) || "?") + ")",
+        method: a && a.url ? ("indeed-" + a.how) : "", scraped_at: new Date().toISOString() } });
+      count += 1;
+      if (count % 3 === 0) await send("PAGE_PROGRESS", { pageIndex: page, totalPages: null, scrapedThisPage: count, status: "running" });
+    }
+    if (aborted) break;
+    if (inBlocked) {
+      await send("SCRAPE_DONE", { error: "Indeed asked for a human check, so the run stopped after " + count + " job(s). Complete the check in the Indeed tab, then run again." });
+      return;
+    }
+    const next = inNextHref(doc, pageUrl);
+    if (!next) break;
+    await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 1000));
+    let html = "";
+    try { const r = await fetch(next, { credentials: "include" }); if (r.ok) html = await r.text(); } catch (_) {}
+    if (!html) break;
+    if (inIsHumanCheck(html)) {
+      await send("SCRAPE_DONE", { error: "Indeed asked for a human check on page " + (page + 1) + ", so the run stopped after " + count + " job(s). Complete it in the tab, then run again." });
+      return;
+    }
+    doc = new DOMParser().parseFromString(html, "text/html");
+    pageUrl = next;
+    if (!inJobs(doc).some((j) => !seen.has(j.jobkey))) break;
+    page += 1;
+  }
+  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+}
+// =================== end indeed.com adapter ===================
+
 async function runScrape(options) {
+  if (liIsTarget()) { return liRun(options); }
+  if (inIsTarget()) { return inRun(options); }
   if (jrIsTarget()) { return jrRun(options); }
   if (chIsTarget()) { return chRun(options); }
   if (sjIsTarget()) { return sjRun(options); }
