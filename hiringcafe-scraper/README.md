@@ -8,10 +8,10 @@ The point of this project: hiring.cafe's "Job Posting" link often doesn't expose
 
 Although this started as a hiring.cafe scraper, the extension now recognises several job boards and picks the right adapter automatically based on the current tab's hostname:
 
-- **hiring.cafe** (now served at hiringcafe.com) — card scraper with Pagination / Load More / Auto-scroll strategies. The employer apply URL is read from each card's own data on the page; a detail-page fetch is the fallback.
-- **careerhound.io** — cards are `article[data-testid="job-card"]` with no links (title and Apply are buttons), so the employer URL comes from the page: a URL attribute, the job's own data, or — when the site only reveals it on click — pressing Apply with opening blocked and recording where it goes (nothing opens and the page never leaves). Company names blurred when signed out are left blank. Scrolls the grid in steps and follows a Next-page button if one appears.
+- **hiring.cafe** — generic card scraper with Pagination / Load More / Auto-scroll strategies and full redirect resolution.
+- **careerhound.io** — dedicated adapter. Career Hound renders results as a card grid where each card's **Apply** link already points at the final external employer / ATS URL (Oracle Cloud, Comeet, BambooHR, Taleo, Greenhouse, gov.uk, ...), so no redirect resolution is needed. All fields are read directly off the card and it walks the standard Previous / Next pager (cards fully replace on each page). Just open your filtered search on `careerhound.io/search?...`, click **Start scraping**, and export the CSV.
 - **eurotoptech.com** — dialog-based adapter (opens each card to read its detail panel).
-- **simplify.jobs** — reads each job from the page's React data inside the `custom-hits` results list, scrolls that list to load more, and follows each job's `/jobs/click/<id>` redirect to the employer (the job's `/p/<id>` page is the fallback).
+- **simplify.jobs** — reads job data from the page's React state and follows the apply redirect in a background tab.
 - **jobright.ai** — dedicated adapter for `/jobs/recommend` (and Liked / Applied / External tabs). Jobright's list is a *virtualised* infinite scroll inside an inner scroll panel (only ~10 cards exist in the DOM at once), so the adapter scrolls that panel itself, collects every card by its job id, and exports the **real employer apply URL** (Greenhouse, Workday, iCIMS, ...) — read from the page's own list-API responses, or from each job's detail page as a fallback. Pagination strategy doesn't matter here (it's always infinite scroll); a picked *Jobs Column* scopes to that list, and a picked *Load more* button is clicked at the bottom if present. Reload the jobright tab once after installing/updating the extension so the API listener is in place.
 - **hnhiring.com** — Hacker News "Who is hiring" ATS-link extractor.
 - **LinkedIn** — open a job search (`linkedin.com/jobs/search/…`). Reads each job in the list (scrolling each into view, since LinkedIn only draws items near the screen), then gets the employer's apply link from the job's own data. **Easy Apply** jobs have no employer link and are flagged instead. Follows LinkedIn's Next-page button; requests are paced like a person browsing, because LinkedIn restricts accounts that look automated.
@@ -19,7 +19,7 @@ Although this started as a hiring.cafe scraper, the extension now recognises sev
 
 ## Features
 
-- **Fast, tab-free resolution** — employer URLs are resolved with parallel `fetch()` redirect-following; no hidden tabs are ever opened.
+- **Lightning-fast resolution** — parallel `fetch()` with redirect-following, plus a bounded pool of hidden tabs as fallback. ~10× faster than naive per-tab resolution.
 - **Three pagination strategies** that you choose from the popup:
   - **Pagination** — click a Next button after each page; cards replace.
   - **Load More** — click an Append button; cards append; only new cards get scraped.
