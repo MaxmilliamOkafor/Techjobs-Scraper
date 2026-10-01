@@ -2008,9 +2008,10 @@ async function liRun(options) {
 // have no employer URL and are flagged. For the rest, the job page's "Apply on
 // company site" link — an Indeed redirect — is followed by the background
 // worker to the employer. Indeed's Next page reloads the tab, which would end
-// this script, so later pages are fetched here instead. Paced; stops cleanly if
-// Indeed shows a human check.
-const IN_JOB_PACE_MS = 600, IN_PAGE_PACE_MS = 1500, IN_MAX_PAGES = 30;
+// this script, so later pages are fetched here instead. Speed: job pages are
+// fetched IN_CONCURRENCY at a time while the next results page loads; stops
+// cleanly if Indeed shows a human check.
+const IN_CONCURRENCY = 5, IN_JITTER_MS = 120, IN_PAGE_PACE_MS = 250, IN_MAX_PAGES = 30;
 function inIsTarget() { return /(^|\.)indeed\.com$/i.test(location.hostname); }
 function inIsIndeed(u) { try { return /(^|\.)indeed\.com$/i.test(new URL(u).hostname); } catch (_) { return false; } }
 function inMosaic(doc) {
@@ -2122,46 +2123,63 @@ async function inRun(options) {
     return;
   }
   const seen = new Set(), visited = new Set([location.href]);
-  let doc = document, pageUrl = location.href, page = 1, count = 0;
-  while (!aborted && page <= IN_MAX_PAGES) {
+  let doc = document, pageUrl = location.href, page = 1, count = 0, stopError = "";
+  const emit = async (j, a) => {
+    const view = location.origin + "/viewjob?jk=" + j.jobkey;
+    await send("JOB_SCRAPED", { row: {
+      url: a ? a.url : "", title: j.title, company: j.company, location: j.location, salary: j.salary,
+      work_mode: "", commitment: "", yoe: "", posted_age: j.posted, description: "", skills: "",
+      job_posting_initial_url: view, hiringcafe_viewall_url: view,
+      status: a && a.url ? "ok" : j.easy ? "Easily apply on Indeed (no external URL)" : "no external apply URL (" + ((a && a.how) || "?") + ")",
+      method: a && a.url ? ("indeed-" + a.how) : "", scraped_at: new Date().toISOString() } });
+    count += 1;
+    if (count % 5 === 0) await send("PAGE_PROGRESS", { pageIndex: page, totalPages: null, scrapedThisPage: count, status: "running" });
+  };
+  // Shared pool: pages feed it, workers drain it, pagination never waits on it.
+  const queue = [];
+  let poolClosed = false;
+  const worker = async () => {
+    while (!aborted && !inBlocked) {
+      const j = queue.shift();
+      if (!j) { if (poolClosed) return; await sleep(40); continue; }
+      const a = await inExternalUrl(j);
+      if (inBlocked) { queue.unshift(j); return; }
+      await emit(j, a);
+      await sleep(Math.round(Math.random() * IN_JITTER_MS));
+    }
+  };
+  const workers = Array.from({ length: IN_CONCURRENCY }, worker);
+  while (!aborted && !inBlocked && page <= IN_MAX_PAGES) {
     for (const j of inJobs(doc, inPickedList(doc, options.columnSpec))) {
-      if (aborted || inBlocked) break;
       if (seen.has(j.jobkey)) continue;
       seen.add(j.jobkey);
-      let a = null;
-      if (!j.easy) { a = await inExternalUrl(j); await sleep(IN_JOB_PACE_MS + Math.round(Math.random() * 400)); }
-      const view = location.origin + "/viewjob?jk=" + j.jobkey;
-      await send("JOB_SCRAPED", { row: {
-        url: a ? a.url : "", title: j.title, company: j.company, location: j.location, salary: j.salary,
-        work_mode: "", commitment: "", yoe: "", posted_age: j.posted, description: "", skills: "",
-        job_posting_initial_url: view, hiringcafe_viewall_url: view,
-        status: a && a.url ? "ok" : j.easy ? "Easily apply on Indeed (no external URL)" : "no external apply URL (" + ((a && a.how) || "?") + ")",
-        method: a && a.url ? ("indeed-" + a.how) : "", scraped_at: new Date().toISOString() } });
-      count += 1;
-      if (count % 3 === 0) await send("PAGE_PROGRESS", { pageIndex: page, totalPages: null, scrapedThisPage: count, status: "running" });
-    }
-    if (aborted) break;
-    if (inBlocked) {
-      await send("SCRAPE_DONE", { error: "Indeed asked for a human check, so the run stopped after " + count + " job(s). Complete the check in the Indeed tab, then run again." });
-      return;
+      if (j.easy) await emit(j, null);      // applied to on Indeed: nothing to fetch
+      else queue.push(j);
     }
     const next = inPickedNextHref(doc, pageUrl, options.paginationSpec);
     if (!next || visited.has(next)) break;
     visited.add(next);
-    await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 1000));
+    await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 250));
+    if (aborted || inBlocked) break;
     let html = "";
     try { const r = await fetch(next, { credentials: "include" }); if (r.ok) html = await r.text(); } catch (_) {}
     if (!html) break;
-    if (inIsHumanCheck(html)) {
-      await send("SCRAPE_DONE", { error: "Indeed asked for a human check on page " + (page + 1) + ", so the run stopped after " + count + " job(s). Complete it in the tab, then run again." });
-      return;
-    }
+    if (inIsHumanCheck(html)) { stopError = "Indeed asked for a human check on page " + (page + 1); break; }
     doc = new DOMParser().parseFromString(html, "text/html");
     pageUrl = next;
     if (!inJobs(doc).some((j) => !seen.has(j.jobkey))) break;
     page += 1;
+    await send("PAGE_PROGRESS", { pageIndex: page, totalPages: null, scrapedThisPage: count, status: "running" });
   }
-  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+  poolClosed = true;
+  await Promise.all(workers);
+  if (aborted) { await send("SCRAPE_DONE", { error: "stopped by user" }); return; }
+  if (inBlocked) stopError = "Indeed asked for a human check";
+  if (stopError) {
+    await send("SCRAPE_DONE", { error: stopError + ", so the run stopped after " + count + " job(s). Complete the check in the Indeed tab, then run again." });
+    return;
+  }
+  await send("SCRAPE_DONE", {});
 }
 // =================== end indeed.com adapter ===================
 

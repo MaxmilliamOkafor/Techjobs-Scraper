@@ -154,6 +154,8 @@ async function fetchFollow(url) {
       signal: ctrl.signal
     });
     clearTimeout(timer);
+    // Only the final URL is needed: stop downloading the page body.
+    try { ctrl.abort(); } catch (_) {}
     return { ok: true, finalUrl: resp.url || url };
   } catch (e) {
     clearTimeout(timer);
