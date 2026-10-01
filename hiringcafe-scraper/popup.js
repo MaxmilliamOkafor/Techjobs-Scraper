@@ -5,14 +5,19 @@ const SETTINGS_KEY = "hiringcafe_settings";
 // Both supported sites — used for tab discovery and validation.
 const SITE_MATCH = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://hiringcafe.com/*", "https://*.hiringcafe.com/*",
+  "https://jobright.ai/*", "https://*.jobright.ai/*",
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
-  "https://hnhiring.com/*", "https://*.hnhiring.com/*"
+  "https://hnhiring.com/*", "https://*.hnhiring.com/*",
+  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*"
 ];
-const ON_SITE_RE = /(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)/;
+const ON_SITE_RE = /(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com\/jobs|indeed\.com)/;
 
 const els = {
+  diagBtn: document.getElementById("diag-btn"),
+  diagLog: document.getElementById("diag-log"),
   startBtn: document.getElementById("start-btn"),
   stopBtn: document.getElementById("stop-btn"),
   exportBtn: document.getElementById("export-btn"),
@@ -32,7 +37,9 @@ const els = {
   tabCount: document.getElementById("tab-count"),
   errorRow: document.getElementById("error-row"),
   progressBar: document.getElementById("progress-bar"),
-  strategyRadios: document.querySelectorAll('input[name="strategy"]')
+  strategyRadios: document.querySelectorAll('input[name="strategy"]'),
+  pickScopeRadios: document.querySelectorAll('input[name="pick-scope"]'),
+  pickSite: document.getElementById("pick-site")
 };
 
 // Lean export: only decision-relevant columns. Internal/duplicate fields
@@ -98,6 +105,29 @@ async function saveSettings(patch) {
   return next;
 }
 
+// Picks are saved per site by default ("picks" keyed by site), or as one
+// shared pick for every site when "Save picks: All sites" is chosen.
+function pickSiteKey(url) {
+  let h = "";
+  try { h = new URL(url).hostname.toLowerCase(); } catch (_) {}
+  if (/(hiring\.cafe|hiringcafe\.com)$/.test(h)) return "hiring.cafe";
+  for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com"]) {
+    if (h === s || h.endsWith("." + s)) return s;
+  }
+  return h.replace(/^www\./, "");
+}
+// The job-site tab the picker and Start act on (most recently used one).
+async function currentSiteTab() {
+  const tabs = await chrome.tabs.query({ url: SITE_MATCH });
+  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  return tabs[0] || null;
+}
+function picksFor(settings, site) {
+  if (settings.pickScope === "all") return { columnSpec: settings.columnSpec || null, paginationSpec: settings.paginationSpec || null };
+  const p = (site && settings.picks && settings.picks[site]) || {};
+  return { columnSpec: p.columnSpec || null, paginationSpec: p.paginationSpec || null };
+}
+
 function setStatusPill(status) {
   const map = {
     idle:     ["pill-idle", "Idle"],
@@ -140,8 +170,14 @@ function render(state, resultCount) {
   for (const r of els.strategyRadios) r.disabled = isRunning;
 }
 
-function renderSinglePicker(spec, resultEl, clearBtn) {
-  if (spec) {
+// Which picker (if any) is waiting for a click on the page, and in which tab.
+let picking = null;   // { mode: "column" | "pagination", tabId }
+function renderSinglePicker(spec, resultEl, clearBtn, mode) {
+  if (picking && picking.mode === mode) {
+    resultEl.className = "picker-result picker-empty";
+    resultEl.textContent = "Picking… click the element on the page (Esc or Un-pick to cancel).";
+    clearBtn.disabled = false;
+  } else if (spec) {
     const label = spec.label || spec.text || spec.ariaLabel || spec.tag || "element";
     resultEl.className = "picker-result picker-locked";
     resultEl.textContent = `Locked: ${label}`;
@@ -152,9 +188,18 @@ function renderSinglePicker(spec, resultEl, clearBtn) {
     clearBtn.disabled = true;
   }
 }
-function renderPickers(settings) {
-  renderSinglePicker(settings.columnSpec, els.pickerResult, els.pickClearBtn);
-  renderSinglePicker(settings.paginationSpec, els.pickerPaginationResult, els.pickPaginationClearBtn);
+async function renderPickers(settings) {
+  const all = settings.pickScope === "all";
+  for (const r of els.pickScopeRadios) r.checked = r.value === (all ? "all" : "site");
+  const tab = all ? null : await currentSiteTab();
+  const site = tab ? pickSiteKey(tab.url) : null;
+  if (els.pickSite) {
+    els.pickSite.textContent = all ? "Picks apply to every site."
+      : site ? `Picks for ${site}.` : "Open a job site to see its picks.";
+  }
+  const p = picksFor(settings, site);
+  renderSinglePicker(p.columnSpec, els.pickerResult, els.pickClearBtn, "column");
+  renderSinglePicker(p.paginationSpec, els.pickerPaginationResult, els.pickPaginationClearBtn, "pagination");
 }
 
 function setStrategy(value) {
@@ -164,7 +209,7 @@ function setStrategy(value) {
 async function refresh() {
   const settings = await loadSettings();
   setStrategy(settings.strategy || "pagination");
-  renderPickers(settings);
+  await renderPickers(settings);
   const resp = await send("GET_STATE");
   if (!resp || !resp.ok) { setStatusPill("idle"); return; }
   render(resp.state, resp.resultCount);
@@ -173,12 +218,18 @@ async function refresh() {
 els.strategyRadios.forEach((r) => {
   r.addEventListener("change", async () => { await saveSettings({ strategy: r.value }); });
 });
+els.pickScopeRadios.forEach((r) => {
+  r.addEventListener("change", async () => { if (r.checked) await renderPickers(await saveSettings({ pickScope: r.value })); });
+});
+// Show the right site's picks when you switch tabs or navigate to another site.
+chrome.tabs.onActivated.addListener(async () => { await renderPickers(await loadSettings()); });
+chrome.tabs.onUpdated.addListener(async (_id, info) => { if (info.url) await renderPickers(await loadSettings()); });
 
 async function startPickerMode(mode) {
   els.errorRow.hidden = true;
   const tabs = await chrome.tabs.query({ url: SITE_MATCH });
   if (!tabs.length) {
-    els.errorRow.textContent = "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
+    els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first.";
     els.errorRow.hidden = false;
     return;
   }
@@ -186,30 +237,52 @@ async function startPickerMode(mode) {
   const target = tabs[0];
   await chrome.tabs.update(target.id, { active: true });
   await chrome.windows.update(target.windowId, { focused: true });
+  // Only one picker at a time: switching modes cancels the other first.
+  if (picking) await stopPicking();
   const resp = await send("START_PICKER", { tabId: target.id, mode });
   if (!resp || !resp.ok) {
     els.errorRow.textContent = (resp && resp.error) || "Could not start picker.";
     els.errorRow.hidden = false;
+    return;
   }
+  picking = { mode, tabId: target.id };
+  await renderPickers(await loadSettings());
+}
+// Cancel picking on the page (as if Esc was pressed there).
+async function stopPicking() {
+  const p = picking; picking = null;
+  if (p) { try { await chrome.tabs.sendMessage(p.tabId, { type: "STOP_PICKER" }); } catch (_) {} }
 }
 
 els.pickBtn.addEventListener("click", () => startPickerMode("column"));
 els.pickPaginationBtn.addEventListener("click", () => startPickerMode("pagination"));
 
-els.pickClearBtn.addEventListener("click", async () => {
-  const s = await saveSettings({ columnSpec: null });
-  renderPickers(s);
-});
-els.pickPaginationClearBtn.addEventListener("click", async () => {
-  const s = await saveSettings({ paginationSpec: null });
-  renderPickers(s);
-});
+// Un-pick: cancel picking in progress for that row, and remove its saved element.
+async function unpick(mode) {
+  if (picking && picking.mode === mode) await stopPicking();
+  const key = mode === "column" ? "columnSpec" : "paginationSpec";
+  const cur = await loadSettings();
+  let s;
+  if (cur.pickScope === "all") s = await saveSettings({ [key]: null });
+  else {
+    const tab = await currentSiteTab();
+    const site = tab ? pickSiteKey(tab.url) : null;
+    const picks = { ...(cur.picks || {}) };
+    if (site && picks[site]) picks[site] = { ...picks[site], [key]: null };
+    s = await saveSettings({ picks });
+  }
+  await renderPickers(s);
+}
+els.pickClearBtn.addEventListener("click", () => unpick("column"));
+els.pickPaginationClearBtn.addEventListener("click", () => unpick("pagination"));
 
 els.startBtn.addEventListener("click", async () => {
   els.errorRow.hidden = true;
   els.startBtn.disabled = true;
   const settings = await loadSettings();
-  if (settings.strategy === "loadmore" && !settings.paginationSpec) {
+  const siteTab = await currentSiteTab();
+  const picks = picksFor(settings, siteTab ? pickSiteKey(siteTab.url) : null);
+  if (settings.strategy === "loadmore" && !picks.paginationSpec) {
     els.errorRow.textContent = "Pick the Load More button first (use the Pagination picker above).";
     els.errorRow.hidden = false;
     els.startBtn.disabled = false;
@@ -220,7 +293,7 @@ els.startBtn.addEventListener("click", async () => {
   if (!onSite) {
     const tabs = await chrome.tabs.query({ url: SITE_MATCH });
     if (!tabs.length) {
-      els.errorRow.textContent = "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first.";
+      els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first.";
       els.errorRow.hidden = false;
       els.startBtn.disabled = false;
       return;
@@ -229,8 +302,8 @@ els.startBtn.addEventListener("click", async () => {
   const resp = await send("START_SCRAPE", {
     options: {
       strategy: settings.strategy || "pagination",
-      columnSpec: settings.columnSpec || null,
-      paginationSpec: settings.paginationSpec || null
+      columnSpec: picks.columnSpec,
+      paginationSpec: picks.paginationSpec
     }
   });
   if (!resp || !resp.ok) {
@@ -255,9 +328,83 @@ els.exportBtn.addEventListener("click", async () => {
   downloadCsv(csv, `tech-jobs-${stamp}.csv`);
 });
 
+// ---- Diagnostics: capture the page structure for selector debugging --------
+// Runs in the page and returns a compact, shareable snapshot: what job cards and
+// apply controls actually look like right now. Avoids guessing at selectors.
+function capturePageStructure() {
+  const txt = (el) => ((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim();
+  const clip = (s, n) => (s && s.length > n ? s.slice(0, n) + " …[truncated]" : s || "");
+  const hasFiber = (el) => !!(el && Object.keys(el).some((k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")));
+  const APPLY_RE = /\b(apply\s+with\s+autofill|apply\s+now|apply|job\s+posting)\b/i;
+
+  const applyControls = Array.from(document.querySelectorAll('a, button, [role="button"]'))
+    .filter((el) => APPLY_RE.test(txt(el)))
+    .slice(0, 4);
+
+  // Climb from an apply control to something card-sized.
+  const cardOf = (el) => {
+    let n = el, i = 0;
+    while (n && n !== document.body && i < 25) { if (txt(n).length > 60) return n; n = n.parentElement; i += 1; }
+    return el;
+  };
+  const cards = [];
+  const seen = new Set();
+  for (const c of applyControls) {
+    const card = cardOf(c);
+    if (card && !seen.has(card)) { seen.add(card); cards.push(card); }
+  }
+
+  const lines = [];
+  lines.push("URL: " + location.href);
+  lines.push("Host: " + location.hostname);
+  lines.push("Job-ish links: " + document.querySelectorAll('a[href*="/job/"], a[href*="/jobs/"], a[href*="job="]').length);
+  lines.push("[data-testid] nodes: " + document.querySelectorAll("[data-testid]").length);
+  const testids = Array.from(new Set(Array.from(document.querySelectorAll("[data-testid]"))
+    .map((e) => e.getAttribute("data-testid")).filter(Boolean))).slice(0, 25);
+  lines.push("data-testid values: " + (testids.join(", ") || "(none)"));
+  lines.push("Apply-ish controls found: " + applyControls.length);
+  lines.push("React fiber on first control: " + (applyControls[0] ? hasFiber(applyControls[0]) : "n/a"));
+  lines.push("");
+  applyControls.slice(0, 2).forEach((c, i) => {
+    lines.push("--- APPLY CONTROL " + (i + 1) + " (<" + c.tagName.toLowerCase() + ">, text: " + JSON.stringify(txt(c)) + ") ---");
+    lines.push(clip(c.outerHTML, 1200));
+    lines.push("");
+  });
+  cards.slice(0, 2).forEach((c, i) => {
+    lines.push("--- CARD " + (i + 1) + " ---");
+    lines.push(clip(c.outerHTML, 3000));
+    lines.push("");
+  });
+  return lines.join("\n");
+}
+
+if (els.diagBtn) {
+  els.diagBtn.addEventListener("click", async () => {
+    els.diagLog.textContent = "Capturing…";
+    try {
+      const tabs = await chrome.tabs.query({ url: SITE_MATCH });
+      if (!tabs.length) { els.diagLog.textContent = "Open a supported job site in a tab first."; return; }
+      tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tabs[0].id }, func: capturePageStructure, world: "MAIN"
+      });
+      const out = (res && res.result) || "(no output)";
+      els.diagLog.textContent = out;
+      try {
+        await navigator.clipboard.writeText(out);
+        els.diagLog.textContent = "✔ Copied to clipboard — paste it to whoever is fixing the selectors.\n\n" + out;
+      } catch (_) {
+        els.diagLog.textContent = "(Clipboard blocked — select the text below and copy manually.)\n\n" + out;
+      }
+    } catch (e) {
+      els.diagLog.textContent = "Capture failed: " + (e?.message || e);
+    }
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "STATE_UPDATE") refresh();
-  if (msg && msg.type === "ELEMENT_PICKED") refresh();
+  if (msg && (msg.type === "ELEMENT_PICKED" || msg.type === "PICKER_CANCELLED")) { picking = null; refresh(); }
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[SETTINGS_KEY]) refresh();
