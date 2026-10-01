@@ -37,7 +37,9 @@ const els = {
   tabCount: document.getElementById("tab-count"),
   errorRow: document.getElementById("error-row"),
   progressBar: document.getElementById("progress-bar"),
-  strategyRadios: document.querySelectorAll('input[name="strategy"]')
+  strategyRadios: document.querySelectorAll('input[name="strategy"]'),
+  pickScopeRadios: document.querySelectorAll('input[name="pick-scope"]'),
+  pickSite: document.getElementById("pick-site")
 };
 
 // Lean export: only decision-relevant columns. Internal/duplicate fields
@@ -103,6 +105,29 @@ async function saveSettings(patch) {
   return next;
 }
 
+// Picks are saved per site by default ("picks" keyed by site), or as one
+// shared pick for every site when "Save picks: All sites" is chosen.
+function pickSiteKey(url) {
+  let h = "";
+  try { h = new URL(url).hostname.toLowerCase(); } catch (_) {}
+  if (/(hiring\.cafe|hiringcafe\.com)$/.test(h)) return "hiring.cafe";
+  for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com"]) {
+    if (h === s || h.endsWith("." + s)) return s;
+  }
+  return h.replace(/^www\./, "");
+}
+// The job-site tab the picker and Start act on (most recently used one).
+async function currentSiteTab() {
+  const tabs = await chrome.tabs.query({ url: SITE_MATCH });
+  tabs.sort((a, b) => (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  return tabs[0] || null;
+}
+function picksFor(settings, site) {
+  if (settings.pickScope === "all") return { columnSpec: settings.columnSpec || null, paginationSpec: settings.paginationSpec || null };
+  const p = (site && settings.picks && settings.picks[site]) || {};
+  return { columnSpec: p.columnSpec || null, paginationSpec: p.paginationSpec || null };
+}
+
 function setStatusPill(status) {
   const map = {
     idle:     ["pill-idle", "Idle"],
@@ -163,9 +188,18 @@ function renderSinglePicker(spec, resultEl, clearBtn, mode) {
     clearBtn.disabled = true;
   }
 }
-function renderPickers(settings) {
-  renderSinglePicker(settings.columnSpec, els.pickerResult, els.pickClearBtn, "column");
-  renderSinglePicker(settings.paginationSpec, els.pickerPaginationResult, els.pickPaginationClearBtn, "pagination");
+async function renderPickers(settings) {
+  const all = settings.pickScope === "all";
+  for (const r of els.pickScopeRadios) r.checked = r.value === (all ? "all" : "site");
+  const tab = all ? null : await currentSiteTab();
+  const site = tab ? pickSiteKey(tab.url) : null;
+  if (els.pickSite) {
+    els.pickSite.textContent = all ? "Picks apply to every site."
+      : site ? `Picks for ${site}.` : "Open a job site to see its picks.";
+  }
+  const p = picksFor(settings, site);
+  renderSinglePicker(p.columnSpec, els.pickerResult, els.pickClearBtn, "column");
+  renderSinglePicker(p.paginationSpec, els.pickerPaginationResult, els.pickPaginationClearBtn, "pagination");
 }
 
 function setStrategy(value) {
@@ -175,7 +209,7 @@ function setStrategy(value) {
 async function refresh() {
   const settings = await loadSettings();
   setStrategy(settings.strategy || "pagination");
-  renderPickers(settings);
+  await renderPickers(settings);
   const resp = await send("GET_STATE");
   if (!resp || !resp.ok) { setStatusPill("idle"); return; }
   render(resp.state, resp.resultCount);
@@ -184,6 +218,12 @@ async function refresh() {
 els.strategyRadios.forEach((r) => {
   r.addEventListener("change", async () => { await saveSettings({ strategy: r.value }); });
 });
+els.pickScopeRadios.forEach((r) => {
+  r.addEventListener("change", async () => { if (r.checked) await renderPickers(await saveSettings({ pickScope: r.value })); });
+});
+// Show the right site's picks when you switch tabs or navigate to another site.
+chrome.tabs.onActivated.addListener(async () => { await renderPickers(await loadSettings()); });
+chrome.tabs.onUpdated.addListener(async (_id, info) => { if (info.url) await renderPickers(await loadSettings()); });
 
 async function startPickerMode(mode) {
   els.errorRow.hidden = true;
@@ -206,7 +246,7 @@ async function startPickerMode(mode) {
     return;
   }
   picking = { mode, tabId: target.id };
-  renderPickers(await loadSettings());
+  await renderPickers(await loadSettings());
 }
 // Cancel picking on the page (as if Esc was pressed there).
 async function stopPicking() {
@@ -220,8 +260,18 @@ els.pickPaginationBtn.addEventListener("click", () => startPickerMode("paginatio
 // Un-pick: cancel picking in progress for that row, and remove its saved element.
 async function unpick(mode) {
   if (picking && picking.mode === mode) await stopPicking();
-  const s = await saveSettings(mode === "column" ? { columnSpec: null } : { paginationSpec: null });
-  renderPickers(s);
+  const key = mode === "column" ? "columnSpec" : "paginationSpec";
+  const cur = await loadSettings();
+  let s;
+  if (cur.pickScope === "all") s = await saveSettings({ [key]: null });
+  else {
+    const tab = await currentSiteTab();
+    const site = tab ? pickSiteKey(tab.url) : null;
+    const picks = { ...(cur.picks || {}) };
+    if (site && picks[site]) picks[site] = { ...picks[site], [key]: null };
+    s = await saveSettings({ picks });
+  }
+  await renderPickers(s);
 }
 els.pickClearBtn.addEventListener("click", () => unpick("column"));
 els.pickPaginationClearBtn.addEventListener("click", () => unpick("pagination"));
@@ -230,7 +280,9 @@ els.startBtn.addEventListener("click", async () => {
   els.errorRow.hidden = true;
   els.startBtn.disabled = true;
   const settings = await loadSettings();
-  if (settings.strategy === "loadmore" && !settings.paginationSpec) {
+  const siteTab = await currentSiteTab();
+  const picks = picksFor(settings, siteTab ? pickSiteKey(siteTab.url) : null);
+  if (settings.strategy === "loadmore" && !picks.paginationSpec) {
     els.errorRow.textContent = "Pick the Load More button first (use the Pagination picker above).";
     els.errorRow.hidden = false;
     els.startBtn.disabled = false;
@@ -250,8 +302,8 @@ els.startBtn.addEventListener("click", async () => {
   const resp = await send("START_SCRAPE", {
     options: {
       strategy: settings.strategy || "pagination",
-      columnSpec: settings.columnSpec || null,
-      paginationSpec: settings.paginationSpec || null
+      columnSpec: picks.columnSpec,
+      paginationSpec: picks.paginationSpec
     }
   });
   if (!resp || !resp.ok) {

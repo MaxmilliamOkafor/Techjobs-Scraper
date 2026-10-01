@@ -64,6 +64,16 @@
       setTimeout(() => finish(empty), timeoutMs);
     });
   }
+  // Which site a saved pick belongs to (same keys as the popup's pickSiteKey).
+  function pickSiteKey(url) {
+    let h = "";
+    try { h = new URL(url).hostname.toLowerCase(); } catch (_) {}
+    if (/(hiring\.cafe|hiringcafe\.com)$/.test(h)) return "hiring.cafe";
+    for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com"]) {
+      if (h === s || h.endsWith("." + s)) return s;
+    }
+    return h.replace(/^www\./, "");
+  }
   function send(type, payload = {}) {
     return new Promise((resolve) => {
       try {
@@ -430,8 +440,15 @@
     const spec = buildElementSpec(target);
     chrome.storage.local.get("hiringcafe_settings").then((r) => {
       const cur = r.hiringcafe_settings || { strategy: "pagination", columnSpec: null, paginationSpec: null };
-      if (pickerMode === "column") cur.columnSpec = spec;
-      else cur.paginationSpec = spec;
+      const key = pickerMode === "column" ? "columnSpec" : "paginationSpec";
+      // "Save picks: All sites" keeps one shared pick; the default saves it
+      // for this site only, so each site remembers its own column / button.
+      if (cur.pickScope === "all") cur[key] = spec;
+      else {
+        const site = pickSiteKey(location.href);
+        cur.picks = { ...(cur.picks || {}) };
+        cur.picks[site] = { ...(cur.picks[site] || {}), [key]: spec };
+      }
       chrome.storage.local.set({ hiringcafe_settings: cur }).then(() => {
         send("ELEMENT_PICKED", { spec, mode: pickerMode });
         stopPicker();

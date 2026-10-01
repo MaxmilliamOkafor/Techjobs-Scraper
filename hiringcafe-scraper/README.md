@@ -43,7 +43,7 @@ Although this started as a hiring.cafe scraper, the extension now recognises sev
    - **Pagination** (default) — works for hiring.cafe's normal numbered-page UI; auto-detects the next button.
    - **Load More** — required when the page has a "Show more results" button instead of pages.
    - **Auto-scroll** — for infinite-scroll feeds.
-4. *(Optional but recommended for Load More)* Click **Pick element**, then on the page **hover** over the Next / Load More / `>` button, and **click** it to lock it in. Press Escape to cancel. The picker overlay shows you which element it's about to capture.
+4. *(Optional but recommended for Load More)* Click **Pick element**, then on the page **hover** over the Next / Load More / `>` button, and **click** it to lock it in. Press Escape to cancel. The picker overlay shows you which element it's about to capture. Picks are saved **per site** by default (each site remembers its own column and button); switch *Save picks* to **All sites** to use one shared pick everywhere.
 5. Click **Start scraping**. Watch the popup:
    - **Page** — current / total
    - **Scraped** — total jobs captured so far
