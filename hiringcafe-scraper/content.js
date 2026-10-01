@@ -1721,26 +1721,71 @@ async function jrRun(options) {
 // else the job page — where an "Apply on company website" job carries
 // companyApplyUrl. Easy Apply jobs have no external URL and are flagged, not
 // given a LinkedIn link. Requests are paced like a person clicking through.
-const LI_PACE_MS = 700;
+// Speed: card fields are read straight off the list (all 25 are rendered), and
+// apply URLs are fetched LI_CONCURRENCY at a time while the next page loads.
+// A 429 from LinkedIn pauses every worker and lowers the concurrency.
+const LI_CONCURRENCY = 4;
+const LI_JITTER_MS = 150;          // per-request jitter, per worker
+const LI_BACKOFF_MS = 8000;        // pause after a rate-limit response
 function liIsTarget() {
   return /(^|\.)linkedin\.com$/i.test(location.hostname) && /^\/jobs\b/.test(location.pathname);
 }
 function liText(el) { return ((el && (el.innerText || el.textContent)) || "").replace(/\s+/g, " ").trim(); }
+// Layouts, newest first:
+//  1. /jobs/search-results/ (2026 redesign, server-driven UI): each card is
+//     div[role=button][componentkey="job-card-component-ref-<jobId>"] inside the
+//     results column (componentkey="SearchResultsMainContent"). No job links,
+//     no data-job-id. The same componentkey sits on the card AND its inner
+//     wrapper, so only the outermost element per id is kept.
+//  2. Classic /jobs/search/: li[data-occludable-job-id] / [data-job-id].
+//  3. Anything else: the /jobs/view/<id> link.
+// The detail pane on the right is never a source: layouts 2/3 are scoped to the
+// results list when it can be found, so the open job is not read as a "card".
+const LI_SDUI_CARD = '[componentkey^="job-card-component-ref-"]';
 function liCards() {
   const byId = new Map();
-  for (const el of document.querySelectorAll("[data-occludable-job-id], [data-job-id]")) {
+  for (const el of document.querySelectorAll(LI_SDUI_CARD)) {
+    const id = (el.getAttribute("componentkey").match(/(\d{6,})$/) || [])[1];
+    if (id && !byId.has(id)) byId.set(id, el);                         // document order: outermost first
+  }
+  if (byId.size) return Array.from(byId, ([id, el]) => ({ id, el }));
+  const list = document.querySelector(".scaffold-layout__list, .jobs-search-results-list, .jobs-search__results-list") || document;
+  for (const el of list.querySelectorAll("[data-occludable-job-id], li[data-job-id], div[data-job-id]")) {
+    if (el.closest(".jobs-search__job-details, .scaffold-layout__detail, .jobs-details")) continue;
     const id = el.getAttribute("data-occludable-job-id") || el.getAttribute("data-job-id");
     if (id && /^\d{6,}$/.test(id) && !byId.has(id)) byId.set(id, el);   // outermost first
   }
   if (!byId.size) {                       // other layouts: the job link carries the id
-    for (const a of document.querySelectorAll('a[href*="/jobs/view/"]')) {
+    for (const a of list.querySelectorAll('a[href*="/jobs/view/"]')) {
+      if (a.closest(".jobs-search__job-details, .scaffold-layout__detail, .jobs-details")) continue;
       const m = (a.getAttribute("href") || "").match(/\/jobs\/view\/(?:[^/?#]*-)?(\d{6,})/);
       if (m && !byId.has(m[1])) byId.set(m[1], a.closest("li") || a);
     }
   }
   return Array.from(byId, ([id, el]) => ({ id, el }));
 }
+// Visible text of an element, skipping screen-reader-only children (LinkedIn
+// pairs every visible label with an absolutely-positioned 1px duplicate such
+// as "Data Engineer (Verified job)" or "Posted 3 days ago").
+function liVisText(el) {
+  if (!el) return "";
+  const kids = Array.from(el.children);
+  if (!kids.length) return liText(el);
+  const vis = kids.filter((k) => getComputedStyle(k).position !== "absolute");
+  return (vis.length ? vis.map(liText).join(" ") : liText(el)).replace(/\s+/g, " ").trim();
+}
+function liSduiCardFields(el) {
+  const ps = Array.from(el.querySelectorAll("p")).filter((p) => !p.querySelector("p"));
+  const vals = ps.map(liVisText).filter((t) => t && t !== "·");
+  let title = vals[0] || "";
+  title = title.replace(/\s*\(Verified job\)\s*$/i, "").replace(/\s+with verification$/i, "").trim();
+  const postedP = ps.find((p) => /^\s*Posted\b/i.test(liText(p)) || /\bago\b/i.test(liVisText(p)));
+  let posted = postedP ? liVisText(postedP).replace(/^Posted\s+/i, "") : "";
+  if (!posted) { const t = el.querySelector("time"); posted = t ? (liText(t) || t.getAttribute("datetime") || "") : ""; }
+  return { title, company: vals[1] || "", location: vals[2] || "", easy: /\bEasy Apply\b/i.test(liText(el)), posted };
+}
 function liCardFields(el) {
+  if (el.matches && el.matches(LI_SDUI_CARD)) return liSduiCardFields(el);
   const link = el.querySelector('a[href*="/jobs/view/"]');
   let title = (link && link.getAttribute("aria-label")) ||
     liText(el.querySelector(".job-card-list__title, .job-card-container__link strong, strong")) || liText(link);
@@ -1795,10 +1840,12 @@ async function liJobApply(id) {
   try {
     const r = await fetch("/voyager/api/jobs/jobPostings/" + id, { credentials: "include",
       headers: { "csrf-token": liCsrf(), "x-restli-protocol-version": "2.0.0", "accept": "application/vnd.linkedin.normalized+json+2.1" } });
+    if (r.status === 429 || r.status === 999) return { url: "", easy: false, how: "rate-limited", limited: true };
     if (r.ok) { const res = liFromJson(await r.json()); if (res.url || res.easy) return Object.assign(res, { how: "jobs-api" }); }
   } catch (_) {}
   try {
     const r = await fetch("/jobs/view/" + id + "/", { credentials: "include" });
+    if (r.status === 429 || r.status === 999) return { url: "", easy: false, how: "rate-limited", limited: true };
     if (r.ok) return Object.assign(liFromHtml(await r.text()), { how: "job-page" });
   } catch (_) {}
   return { url: "", easy: false, how: "job data unavailable" };
@@ -1806,6 +1853,15 @@ async function liJobApply(id) {
 function liNextButton() {
   const b = document.querySelector('button[aria-label="View next page"], button.jobs-search-pagination__button--next');
   if (b) return b;
+  // Redesigned layout: a plain "Next" button at the foot of the results column.
+  // Scoped to that column: the detail pane has its own aria-label="Next"
+  // carousel arrow, which must never be mistaken for pagination.
+  const col = document.querySelector('[componentkey="SearchResultsMainContent"]');
+  if (col) {
+    const isNext = (x) => /^next$/i.test(liText(x)) || /^next$/i.test((x.getAttribute("aria-label") || "").trim());
+    const nb = Array.from(col.querySelectorAll('button, a[role="button"]')).find(isNext);
+    if (nb) return nb;
+  }
   const act = document.querySelector("li[data-test-pagination-page-btn].active, li.artdeco-pagination__indicator--number.active");
   return (act && act.nextElementSibling && act.nextElementSibling.querySelector("button")) || null;
 }
@@ -1842,23 +1898,44 @@ async function liRun(options) {
     await send("SCRAPE_DONE", {});
     return;
   }
+  // Shared fetch pool: pages feed it, workers drain it, pagination never waits on it.
+  const queue = [];
+  let limit = LI_CONCURRENCY, active = 0, pauseUntil = 0, wake = null, poolClosed = false;
+  const kick = () => { if (wake) { const w = wake; wake = null; w(); } };
+  const worker = async () => {
+    while (!aborted) {
+      const job = queue.shift();
+      if (!job) { if (poolClosed) return; await new Promise((r) => { wake = r; setTimeout(r, 200); }); continue; }
+      while (Date.now() < pauseUntil && !aborted) await sleep(250);
+      if (active >= limit) { queue.unshift(job); await sleep(100); continue; }
+      active += 1;
+      let a = await liJobApply(job.id);
+      if (a.limited) {                                   // back off, slow down, retry once
+        pauseUntil = Date.now() + LI_BACKOFF_MS; limit = Math.max(1, limit - 1);
+        await sleep(LI_BACKOFF_MS);
+        a = await liJobApply(job.id);
+      }
+      active -= 1;
+      await emit(job.id, job.f, a);
+      await sleep(Math.round(Math.random() * LI_JITTER_MS));
+    }
+  };
+  const workers = Array.from({ length: LI_CONCURRENCY }, worker);
+
   while (!aborted) {
-    const fresh = liCards().filter((c) => !seen.has(c.id));
-    for (const { id } of fresh) {
+    // Read every fresh card now. Only an unrendered (occluded) card is scrolled to.
+    for (const { id, el } of liCards().filter((c) => !seen.has(c.id))) {
       if (aborted) break;
       seen.add(id);
-      let el = (liCards().find((c) => c.id === id) || {}).el;
-      if (!el) continue;
-      try { el.scrollIntoView({ block: "center" }); } catch (_) {}
-      await sleep(300);                                   // let an occluded item render
-      el = (liCards().find((c) => c.id === id) || {}).el || el;
-      const f = liCardFields(el);
-      let a = null;
-      if (!f.easy) {                                      // Easy Apply: nothing external to fetch
-        a = await liJobApply(id);
-        await sleep(LI_PACE_MS + Math.round(Math.random() * 500));
+      let card = el;
+      if (liText(card).length < 15) {
+        try { card.scrollIntoView({ block: "center" }); } catch (_) {}
+        await sleep(150);
+        card = (liCards().find((c) => c.id === id) || {}).el || card;
       }
-      await emit(id, f, a);
+      const f = liCardFields(card);
+      if (f.easy) await emit(id, f, null);              // Easy Apply: nothing external to fetch
+      else { queue.push({ id, f }); kick(); }
     }
     if (aborted) break;
     // Next page: the list is replaced in place (no page load).
@@ -1869,13 +1946,16 @@ async function liRun(options) {
     clickAt(next);
     const t0 = Date.now();
     while (Date.now() - t0 < 15000 && !aborted) {
-      await sleep(300);
+      await sleep(120);
       const first = (liCards()[0] || {}).id;
       if (first && first !== before && liCards().some((c) => !seen.has(c.id))) break;
     }
     if (!liCards().some((c) => !seen.has(c.id))) break;
     page += 1;
+    await send("PAGE_PROGRESS", { pageIndex: page, totalPages: null, scrapedThisPage: count, status: "running" });
   }
+  poolClosed = true; kick();
+  await Promise.all(workers);
   await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
 }
 // =================== end linkedin.com adapter ===================
