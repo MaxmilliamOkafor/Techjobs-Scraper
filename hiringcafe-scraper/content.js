@@ -298,6 +298,12 @@
     if (typeof ettIsTarget === "function" && ettIsTarget()) {
       return el.closest(".MuiCard-root");
     }
+    if (typeof inIsTarget === "function" && inIsTarget()) {
+      // A job card: the list row holding a job key, else the card box itself.
+      const row = el.closest("li");
+      if (row && row.querySelector("[data-jk]")) return row;
+      return el.closest(".job_seen_beacon, .cardOutline");
+    }
     let node = el, safety = 0;
     while (node && node !== document.body && safety < 30) {
       const txt = visibleText(node);
@@ -311,6 +317,13 @@
     if (pickerMode === "column") {
       const card = cardContainerOf(raw);
       if (card) return card;
+    }
+    if (pickerMode === "pagination" && typeof inIsTarget === "function" && inIsTarget()) {
+      // Picking a page number ("2", "3"…) would save a link that means a
+      // different page each time; inside Indeed's page bar, use its Next link.
+      const bar = raw.closest && raw.closest('nav, [role="navigation"]');
+      const next = bar && bar.querySelector('a[data-testid="pagination-page-next"], a[aria-label="Next Page"], a[aria-label="Next"]');
+      if (next) return next;
     }
     return nearestClickable(raw);
   }
@@ -333,23 +346,31 @@
     const role = (el.getAttribute && el.getAttribute("role")) || "";
     const tag = el.tagName.toLowerCase();
     const id = el.id || "";
-    return { tag, text, ariaLabel, title, role, id, path: structuralPath(el),
-      label: ariaLabel || text || title || tag };
+    const testid = (el.getAttribute && el.getAttribute("data-testid")) || "";
+    return { tag, text, ariaLabel, title, role, id, testid, path: structuralPath(el),
+      label: ariaLabel || text || title || testid || tag };
   }
-  function findByElementSpec(spec) {
+  // root: the live document, or a fetched page (DOMParser), where nothing is
+  // rendered so visibility cannot be checked.
+  function findByElementSpec(spec, root) {
     if (!spec) return null;
-    if (spec.id) { const el = document.getElementById(spec.id); if (el && isVisible(el)) return el; }
+    const doc = root || document;
+    const ok = (el) => !!el && (doc !== document || isVisible(el));
+    const text = (el) => doc === document ? visibleText(el) : (el.textContent || "").replace(/\s+/g, " ").trim();
+    if (spec.id) { const el = doc.getElementById(spec.id); if (ok(el)) return el; }
+    if (spec.testid) {
+      const escaped = spec.testid.replace(/"/g, '\\"');
+      for (const c of doc.querySelectorAll(`[data-testid="${escaped}"]`)) if (ok(c)) return c;
+    }
     if (spec.ariaLabel) {
       const escaped = spec.ariaLabel.replace(/"/g, '\\"');
-      const candidates = document.querySelectorAll(`[aria-label="${escaped}"]`);
-      for (const c of candidates) if (isVisible(c)) return c;
+      for (const c of doc.querySelectorAll(`[aria-label="${escaped}"]`)) if (ok(c)) return c;
     }
     if (spec.text) {
-      const candidates = document.querySelectorAll(spec.tag || "*");
-      for (const c of candidates) if (visibleText(c) === spec.text && isVisible(c)) return c;
+      for (const c of doc.querySelectorAll(spec.tag || "*")) if (text(c) === spec.text && ok(c)) return c;
     }
     if (spec.path) {
-      try { const el = document.querySelector(spec.path); if (el && isVisible(el)) return el; } catch (_) {}
+      try { const el = doc.querySelector(spec.path); if (ok(el)) return el; } catch (_) {}
     }
     return null;
   }
@@ -421,7 +442,9 @@
     if (!pickerActive) return;
     e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
   }
-  function onPickerKey(e) { if (pickerActive && e.key === "Escape") { e.preventDefault(); stopPicker(); } }
+  function onPickerKey(e) {
+    if (pickerActive && e.key === "Escape") { e.preventDefault(); stopPicker(); send("PICKER_CANCELLED", { mode: pickerMode }); }
+  }
   function startPicker(mode) {
     if (pickerActive) return;
     pickerMode = mode === "column" ? "column" : "pagination";
@@ -1995,15 +2018,25 @@ function inMosaic(doc) {
   }
   return null;
 }
-function inJobs(doc) {
-  const m = inMosaic(doc);
-  if (m && m.length) return m.filter((r) => r && r.jobkey).map((r) => ({
+// list: a picked Jobs Column (the list element), or null for the default.
+function inJobs(doc, list) {
+  const raw = inMosaic(doc);
+  const m = (raw || []).filter((r) => r && r.jobkey).map((r) => ({
     jobkey: r.jobkey, title: r.displayTitle || r.title || "", company: r.company || r.truncatedCompany || "",
     location: r.formattedLocation || "", salary: (r.salarySnippet && r.salarySnippet.text) || "",
     easy: !!r.indeedApplyEnabled, posted: r.formattedRelativeTime || "", direct: r.thirdPartyApplyUrl || "" }));
+  // Picked column: exactly the jobs in that list, filled in from the embedded
+  // data where it has them (it only covers the main results list).
+  if (list) { const byKey = new Map(m.map((j) => [j.jobkey, j])); return inJobsFromDom(list).map((j) => byKey.get(j.jobkey) || j); }
+  if (m.length) return m;
+  // Default: only the main results list. With a job open (vjk=…), the pane on
+  // the right can hold job keys of its own ("similar jobs") that are not results.
+  return inJobsFromDom(doc.querySelector("#mosaic-provider-jobcards") || doc);
+}
+function inJobsFromDom(list) {
   const out = new Map();
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
-  for (const a of doc.querySelectorAll("[data-jk]")) {
+  for (const a of list.querySelectorAll("[data-jk]")) {
     const jk = a.getAttribute("data-jk");
     if (!jk || out.has(jk)) continue;
     const card = a.closest(".job_seen_beacon, .cardOutline, li") || a;
@@ -2043,7 +2076,27 @@ async function inExternalUrl(job) {
   if (resp && resp.ok && resp.finalUrl && !inIsIndeed(resp.finalUrl) && isResolvedExternalUrl(resp.finalUrl)) return { url: resp.finalUrl, how: "apply-redirect" };
   return { url: "", how: "apply redirect stayed on Indeed" + (resp && resp.error ? " (" + resp.error + ")" : "") };
 }
+// A picked Jobs Column: the list the picked card belongs to. Re-resolved on
+// every fetched page; null (= the default main list) if it can't be found.
+function inPickedList(doc, columnSpec) {
+  if (!columnSpec) return null;
+  const el = findByElementSpec(columnSpec, doc);
+  if (!el) return null;
+  const list = el.closest("#mosaic-provider-jobcards, ul, ol") || el;
+  return list.querySelector("[data-jk]") ? list : null;
+}
+// A picked pagination button: its link on this page; else Indeed's own Next.
+function inPickedNextHref(doc, pageUrl, paginationSpec) {
+  if (paginationSpec) {
+    const el = findByElementSpec(paginationSpec, doc);
+    const a = el && (el.closest("a[href]") || (el.querySelector && el.querySelector("a[href]")));
+    const h = a && a.getAttribute("href");
+    if (h) { try { return new URL(h, pageUrl).href; } catch (_) {} }
+  }
+  return inNextHref(doc, pageUrl);
+}
 async function inRun(options) {
+  options = options || {};
   aborted = false; inBlocked = false;
   const start = Date.now();
   while (Date.now() - start < 15000 && !inJobs(document).length && !aborted) await sleep(250);
@@ -2051,10 +2104,10 @@ async function inRun(options) {
     await send("SCRAPE_DONE", { error: "No Indeed jobs found on this page. Open an Indeed job search (indeed.com/jobs?q=…) with results showing, then try again." });
     return;
   }
-  const seen = new Set();
+  const seen = new Set(), visited = new Set([location.href]);
   let doc = document, pageUrl = location.href, page = 1, count = 0;
   while (!aborted && page <= IN_MAX_PAGES) {
-    for (const j of inJobs(doc)) {
+    for (const j of inJobs(doc, inPickedList(doc, options.columnSpec))) {
       if (aborted || inBlocked) break;
       if (seen.has(j.jobkey)) continue;
       seen.add(j.jobkey);
@@ -2075,8 +2128,9 @@ async function inRun(options) {
       await send("SCRAPE_DONE", { error: "Indeed asked for a human check, so the run stopped after " + count + " job(s). Complete the check in the Indeed tab, then run again." });
       return;
     }
-    const next = inNextHref(doc, pageUrl);
-    if (!next) break;
+    const next = inPickedNextHref(doc, pageUrl, options.paginationSpec);
+    if (!next || visited.has(next)) break;
+    visited.add(next);
     await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 1000));
     let html = "";
     try { const r = await fetch(next, { credentials: "include" }); if (r.ok) html = await r.text(); } catch (_) {}

@@ -723,6 +723,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true });
           return;
         }
+        case "PICKER_CANCELLED": {
+          chrome.runtime.sendMessage({ type: "PICKER_CANCELLED", mode: msg.mode }).catch(() => {});
+          sendResponse({ ok: true });
+          return;
+        }
         case "ELEMENT_PICKED": {
           chrome.runtime.sendMessage({ type: "ELEMENT_PICKED", spec: msg.spec, mode: msg.mode }).catch(() => {});
           sendResponse({ ok: true });

@@ -145,8 +145,14 @@ function render(state, resultCount) {
   for (const r of els.strategyRadios) r.disabled = isRunning;
 }
 
-function renderSinglePicker(spec, resultEl, clearBtn) {
-  if (spec) {
+// Which picker (if any) is waiting for a click on the page, and in which tab.
+let picking = null;   // { mode: "column" | "pagination", tabId }
+function renderSinglePicker(spec, resultEl, clearBtn, mode) {
+  if (picking && picking.mode === mode) {
+    resultEl.className = "picker-result picker-empty";
+    resultEl.textContent = "Picking… click the element on the page (Esc or Un-pick to cancel).";
+    clearBtn.disabled = false;
+  } else if (spec) {
     const label = spec.label || spec.text || spec.ariaLabel || spec.tag || "element";
     resultEl.className = "picker-result picker-locked";
     resultEl.textContent = `Locked: ${label}`;
@@ -158,8 +164,8 @@ function renderSinglePicker(spec, resultEl, clearBtn) {
   }
 }
 function renderPickers(settings) {
-  renderSinglePicker(settings.columnSpec, els.pickerResult, els.pickClearBtn);
-  renderSinglePicker(settings.paginationSpec, els.pickerPaginationResult, els.pickPaginationClearBtn);
+  renderSinglePicker(settings.columnSpec, els.pickerResult, els.pickClearBtn, "column");
+  renderSinglePicker(settings.paginationSpec, els.pickerPaginationResult, els.pickPaginationClearBtn, "pagination");
 }
 
 function setStrategy(value) {
@@ -191,24 +197,34 @@ async function startPickerMode(mode) {
   const target = tabs[0];
   await chrome.tabs.update(target.id, { active: true });
   await chrome.windows.update(target.windowId, { focused: true });
+  // Only one picker at a time: switching modes cancels the other first.
+  if (picking) await stopPicking();
   const resp = await send("START_PICKER", { tabId: target.id, mode });
   if (!resp || !resp.ok) {
     els.errorRow.textContent = (resp && resp.error) || "Could not start picker.";
     els.errorRow.hidden = false;
+    return;
   }
+  picking = { mode, tabId: target.id };
+  renderPickers(await loadSettings());
+}
+// Cancel picking on the page (as if Esc was pressed there).
+async function stopPicking() {
+  const p = picking; picking = null;
+  if (p) { try { await chrome.tabs.sendMessage(p.tabId, { type: "STOP_PICKER" }); } catch (_) {} }
 }
 
 els.pickBtn.addEventListener("click", () => startPickerMode("column"));
 els.pickPaginationBtn.addEventListener("click", () => startPickerMode("pagination"));
 
-els.pickClearBtn.addEventListener("click", async () => {
-  const s = await saveSettings({ columnSpec: null });
+// Un-pick: cancel picking in progress for that row, and remove its saved element.
+async function unpick(mode) {
+  if (picking && picking.mode === mode) await stopPicking();
+  const s = await saveSettings(mode === "column" ? { columnSpec: null } : { paginationSpec: null });
   renderPickers(s);
-});
-els.pickPaginationClearBtn.addEventListener("click", async () => {
-  const s = await saveSettings({ paginationSpec: null });
-  renderPickers(s);
-});
+}
+els.pickClearBtn.addEventListener("click", () => unpick("column"));
+els.pickPaginationClearBtn.addEventListener("click", () => unpick("pagination"));
 
 els.startBtn.addEventListener("click", async () => {
   els.errorRow.hidden = true;
@@ -336,7 +352,7 @@ if (els.diagBtn) {
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg && msg.type === "STATE_UPDATE") refresh();
-  if (msg && msg.type === "ELEMENT_PICKED") refresh();
+  if (msg && (msg.type === "ELEMENT_PICKED" || msg.type === "PICKER_CANCELLED")) { picking = null; refresh(); }
 });
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[SETTINGS_KEY]) refresh();
