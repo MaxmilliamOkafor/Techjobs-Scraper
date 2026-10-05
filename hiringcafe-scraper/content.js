@@ -2008,10 +2008,13 @@ async function liRun(options) {
 // have no employer URL and are flagged. For the rest, the job page's "Apply on
 // company site" link — an Indeed redirect — is followed by the background
 // worker to the employer. Indeed's Next page reloads the tab, which would end
-// this script, so later pages are fetched here instead. Speed: job pages are
-// fetched IN_CONCURRENCY at a time while the next results page loads; stops
-// cleanly if Indeed shows a human check.
+// this script, so later pages are fetched here instead. Feeds with no Next
+// page ("Jobs for you") are scrolled to load more cards. Speed: job pages are
+// fetched IN_CONCURRENCY at a time while the next results page loads. If Indeed
+// pushes back (human check / 429), every worker pauses, drops to one at a time
+// and retries; the run only stops if the check is still there after that.
 const IN_CONCURRENCY = 5, IN_JITTER_MS = 120, IN_PAGE_PACE_MS = 250, IN_MAX_PAGES = 30;
+const IN_BACKOFF_MS = [5000, 15000], IN_MAX_SCROLLS = 60;
 function inIsTarget() { return /(^|\.)indeed\.com$/i.test(location.hostname); }
 function inIsIndeed(u) { try { return /(^|\.)indeed\.com$/i.test(new URL(u).hostname); } catch (_) { return false; } }
 function inMosaic(doc) {
@@ -2046,10 +2049,26 @@ function inJobs(doc, list) {
   // Picked column: exactly the jobs in that list, filled in from the embedded
   // data where it has them (it only covers the main results list).
   if (list) { const byKey = new Map(m.map((j) => [j.jobkey, j])); return inJobsFromDom(list).map((j) => byKey.get(j.jobkey) || j); }
-  if (m.length) return m;
   // Default: only the main results list. With a job open (vjk=…), the pane on
   // the right can hold job keys of its own ("similar jobs") that are not results.
-  return inJobsFromDom(doc.querySelector("#mosaic-provider-jobcards") || doc);
+  // Cards a feed added while scrolling are not in the embedded data: add them.
+  const main = doc.querySelector("#mosaic-provider-jobcards") || inMainList(doc);
+  if (m.length) {
+    const keys = new Set(m.map((j) => j.jobkey));
+    return main ? m.concat(inJobsFromDom(main).filter((j) => !keys.has(j.jobkey))) : m;
+  }
+  return inJobsFromDom(main || doc);
+}
+// The list holding the most job cards (the results / "Jobs for you" feed).
+function inMainList(doc) {
+  const counts = new Map();
+  for (const a of doc.querySelectorAll("[data-jk]")) {
+    const l = a.closest("ul, ol");
+    if (l) counts.set(l, (counts.get(l) || 0) + 1);
+  }
+  let best = null, n = 0;
+  for (const [l, c] of counts) if (c > n) { best = l; n = c; }
+  return best;
 }
 function inJobsFromDom(list) {
   const out = new Map();
@@ -2073,15 +2092,20 @@ function inNextHref(doc, pageUrl) {
   const h = a && a.getAttribute("href");
   try { return h ? new URL(h, pageUrl).href : ""; } catch (_) { return ""; }
 }
-function inIsHumanCheck(html) { return /captcha|cf-challenge|Just a moment|verify you are human/i.test(html) && !/data-jk|jobkey/.test(html); }
+// A real check page, not a job page that merely loads a captcha script.
+function inIsHumanCheck(html) {
+  if (/data-jk|jobkey|jobDescriptionText|jobsearch-ViewJob/i.test(html)) return false;
+  return /<title>[^<]*(just a moment|security check|attention required|captcha|blocked)/i.test(html) ||
+    /cf-chl|challenge-platform|cf-challenge|verify you are human|g-recaptcha|h-captcha/i.test(html);
+}
 let inBlocked = false;
 async function inExternalUrl(job) {
   if (job.direct && /^https?:/i.test(job.direct) && !inIsIndeed(job.direct)) return { url: job.direct, how: "list-data" };
   let hop = job.direct && inIsIndeed(job.direct) ? job.direct : "";
   if (!hop) {
-    let html = "";
-    try { html = await (await fetch("/viewjob?jk=" + encodeURIComponent(job.jobkey), { credentials: "include" })).text(); } catch (_) {}
-    if (inIsHumanCheck(html)) { inBlocked = true; return { url: "", how: "Indeed asked for a human check" }; }
+    let html = "", status = 0;
+    try { const r = await fetch("/viewjob?jk=" + encodeURIComponent(job.jobkey), { credentials: "include" }); status = r.status; html = await r.text(); } catch (_) {}
+    if (status === 429 || status === 403 || inIsHumanCheck(html)) return { url: "", how: "Indeed asked for a human check", blocked: true };
     const txt = html.replace(/&quot;/g, '"').replace(/&amp;/g, "&").replace(/\\u002F/gi, "/").replace(/\\\//g, "/");
     const d = txt.match(/"(?:companyApplyUrl|externalApplyUrl|thirdPartyApplyUrl)"\s*:\s*"(https?:[^"]+)"/);
     if (d && !inIsIndeed(d[1])) return { url: d[1], how: "job-page" };
@@ -2113,6 +2137,76 @@ function inPickedNextHref(doc, pageUrl, paginationSpec) {
   }
   return inNextHref(doc, pageUrl);
 }
+// Fallback when Indeed refuses our job-page downloads: open the job in the
+// page's own job pane (as a click on the card does) and read its "Apply on
+// company site" link there. One job at a time, only for cards on this page.
+function inLiveCard(jk) { return document.querySelector('[data-jk="' + CSS.escape(jk) + '"]'); }
+function inPane() {
+  return document.querySelector('#jobsearch-ViewjobPaneWrapper, .jobsearch-RightPane, #vjs-container, [data-testid="jobsearch-ViewJobLayout"], .jobsearch-ViewJobLayout--embedded');
+}
+function inPaneApply(pane) {
+  for (const el of pane.querySelectorAll("a[href], button[href], [data-href]")) {
+    if (el.closest("[data-jk]")) continue;
+    const h = el.getAttribute("href") || el.getAttribute("data-href") || "";
+    const label = ((el.getAttribute("aria-label") || "") + " " + (el.textContent || "")).trim();
+    if (/applystart|\/rc\/clk|\/pagead\/clk/i.test(h) || (/company site|employer site|apply externally/i.test(label) && /^https?:|^\//.test(h))) {
+      try { return new URL(h, location.origin).href; } catch (_) {}
+    }
+  }
+  return "";
+}
+async function inPaneUrl(j) {
+  const a = inLiveCard(j.jobkey);
+  if (!a) return { url: "", how: "card not on the page" };
+  const card = a.closest(".job_seen_beacon, .cardOutline, li") || a;
+  const p0 = inPane(), before = p0 ? p0.innerHTML : null;
+  // Click the card body, not its title link (the link would leave the page).
+  const target = card.querySelector('[data-testid="company-name"], .companyName, [data-testid="text-location"]') || card;
+  target.scrollIntoView({ block: "center" });
+  target.click();
+  const start = Date.now();
+  while (Date.now() - start < 8000 && !aborted) {
+    await sleep(150);
+    const pane = inPane();
+    if (!pane) { if (Date.now() - start > 2500) return { url: "", how: "no job pane on this page", noPane: true }; continue; }
+    const t = (pane.textContent || "").replace(/\s+/g, " ");
+    const vjk = new URLSearchParams(location.search).get("vjk");
+    if (vjk !== j.jobkey && !(j.title && t.includes(j.title))) continue;
+    const hop = inPaneApply(pane);
+    const hopJk = (hop.match(/[?&]jk=([^&#]+)/) || [])[1];
+    // Wait for the pane to show THIS job, not the one that was open before.
+    if (hopJk ? hopJk !== j.jobkey : pane.innerHTML === before) continue;
+    if (!hop) {
+      if (Array.from(pane.querySelectorAll("button, a")).some((b) => /^(apply now|easily apply)/i.test((b.textContent || "").trim())))
+        return { url: "", how: "job pane: applied to on Indeed, no company-site link" };
+      continue;
+    }
+    if (!inIsIndeed(hop)) return { url: hop, how: "job-pane" };
+    const resp = await send("RESOLVE_URL", { url: hop });
+    if (resp && resp.ok && resp.finalUrl && !inIsIndeed(resp.finalUrl) && isResolvedExternalUrl(resp.finalUrl)) return { url: resp.finalUrl, how: "job-pane" };
+    return { url: "", how: "apply redirect stayed on Indeed" };
+  }
+  return { url: "", how: "job pane showed no company-site apply link", paneFailed: true };
+}
+// Scroll a feed page (or click its picked / "Show more" button) and wait for new cards.
+function inIsFeed(options) {
+  return options.strategy === "autoscroll" || options.strategy === "loadmore" ||
+    !document.querySelector('[data-testid^="pagination-page"], nav[role="navigation"] a, nav[aria-label*="pagination" i]');
+}
+async function inScrollMore(paginationSpec) {
+  const cardCount = () => new Set(Array.from(document.querySelectorAll("[data-jk]"), (a) => a.getAttribute("data-jk"))).size;
+  const before = cardCount();
+  let btn = paginationSpec ? findByElementSpec(paginationSpec, document) : null;
+  if (!btn) btn = Array.from(document.querySelectorAll('button, a[role="button"]')).find((b) =>
+    /^(show more|load more|more jobs|see more jobs)\b/i.test((b.textContent || "").trim()) && b.getClientRects().length && !b.disabled);
+  if (btn) { try { btn.click(); } catch (_) {} }
+  const cards = document.querySelectorAll("[data-jk]");
+  if (cards.length) cards[cards.length - 1].scrollIntoView({ block: "end" });
+  window.scrollTo(0, document.documentElement.scrollHeight);
+  const until = Date.now() + 2500;
+  while (Date.now() < until && !aborted) { await sleep(150); if (cardCount() > before) { await sleep(300); return true; } }
+  return false;
+}
 async function inRun(options) {
   options = options || {};
   aborted = false; inBlocked = false;
@@ -2123,7 +2217,7 @@ async function inRun(options) {
     return;
   }
   const seen = new Set(), visited = new Set([location.href]);
-  let doc = document, pageUrl = location.href, page = 1, count = 0, stopError = "";
+  let doc = document, pageUrl = location.href, page = 1, count = 0, stopError = "", scrolls = 0, noGrowth = 0;
   const emit = async (j, a) => {
     const view = location.origin + "/viewjob?jk=" + j.jobkey;
     await send("JOB_SCRAPED", { row: {
@@ -2137,13 +2231,33 @@ async function inRun(options) {
   };
   // Shared pool: pages feed it, workers drain it, pagination never waits on it.
   const queue = [];
-  let poolClosed = false;
+  let poolClosed = false, limit = IN_CONCURRENCY, active = 0, pauseUntil = 0;
+  let paneMode = false, paneFails = 0, paneLock = Promise.resolve();
+  const viaPane = (j) => { const p = paneLock.then(() => inPaneUrl(j)); paneLock = p.catch(() => {}); return p; };
   const worker = async () => {
     while (!aborted && !inBlocked) {
+      if (Date.now() < pauseUntil) { await sleep(200); continue; }
+      if (active >= limit) { await sleep(100); continue; }
       const j = queue.shift();
       if (!j) { if (poolClosed) return; await sleep(40); continue; }
-      const a = await inExternalUrl(j);
-      if (inBlocked) { queue.unshift(j); return; }
+      active += 1;
+      let a = paneMode && inLiveCard(j.jobkey) ? { blocked: true } : await inExternalUrl(j);
+      // Job page refused: read this job from the page's own job pane instead.
+      if (a.blocked && paneFails < 3 && inLiveCard(j.jobkey)) {
+        paneMode = true; limit = 1;
+        a = await viaPane(j);
+        if (a.noPane) paneFails = 3; else if (a.paneFailed) paneFails += 1; else paneFails = 0;
+        if (paneFails >= 3) a = { blocked: true };
+      }
+      // Indeed pushed back: everyone pauses, then carry on one at a time.
+      for (let i = 0; a.blocked && i < IN_BACKOFF_MS.length && !aborted; i++) {
+        limit = 1;
+        pauseUntil = Math.max(pauseUntil, Date.now() + IN_BACKOFF_MS[i]);
+        while (Date.now() < pauseUntil && !aborted) await sleep(200);
+        a = await inExternalUrl(j);
+      }
+      active -= 1;
+      if (a.blocked) { inBlocked = true; queue.unshift(j); return; }
       await emit(j, a);
       await sleep(Math.round(Math.random() * IN_JITTER_MS));
     }
@@ -2157,6 +2271,13 @@ async function inRun(options) {
       else queue.push(j);
     }
     const next = inPickedNextHref(doc, pageUrl, options.paginationSpec);
+    if (!next && doc === document && scrolls < IN_MAX_SCROLLS && inIsFeed(options)) {
+      // No Next page: a feed that loads more cards as you scroll.
+      scrolls += 1;
+      if (await inScrollMore(options.paginationSpec)) { noGrowth = 0; continue; }
+      if (++noGrowth < 2) continue;
+      break;
+    }
     if (!next || visited.has(next)) break;
     visited.add(next);
     await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 250));
