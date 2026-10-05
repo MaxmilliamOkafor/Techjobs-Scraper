@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Tech Jobs URL Scraper",
-  "version": "2.6.0",
-  "description": "Scrapes job listings/apply URLs from hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, and hnhiring.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
+  "version": "2.12.6",
+  "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, linkedin.com and indeed.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
   "permissions": [
     "tabs",
     "storage",
@@ -13,6 +13,8 @@
   "host_permissions": [
     "https://hiring.cafe/*",
     "https://*.hiring.cafe/*",
+    "https://hiringcafe.com/*",
+    "https://*.hiringcafe.com/*",
     "https://eurotoptech.com/*",
     "https://*.eurotoptech.com/*",
     "https://simplify.jobs/*",
@@ -20,8 +22,13 @@
     "https://hnhiring.com/*",
     "https://*.hnhiring.com/*",
     "https://app.lazyapply.com/*",
+    "https://jobright.ai/*",
+    "https://*.jobright.ai/*",
     "https://careerhound.io/*",
     "https://*.careerhound.io/*",
+    "https://www.linkedin.com/*",
+    "https://indeed.com/*",
+    "https://*.indeed.com/*",
     "<all_urls>"
   ],
   "background": {
@@ -41,14 +48,21 @@
   "content_scripts": [
     {
       "matches": [
+        "https://jobright.ai/*",
+        "https://*.jobright.ai/*",
         "https://hiring.cafe/*",
         "https://*.hiring.cafe/*",
+        "https://hiringcafe.com/*",
+        "https://*.hiringcafe.com/*",
         "https://eurotoptech.com/*",
         "https://*.eurotoptech.com/*",
         "https://simplify.jobs/*",
         "https://*.simplify.jobs/*",
         "https://careerhound.io/*",
-        "https://*.careerhound.io/*"
+        "https://*.careerhound.io/*",
+        "https://www.linkedin.com/jobs/*",
+        "https://indeed.com/*",
+        "https://*.indeed.com/*"
       ],
       "js": [
         "content.js"
@@ -74,6 +88,43 @@
       "js": [
         "hnhiring.js"
       ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://hiring.cafe/*",
+        "https://*.hiring.cafe/*",
+        "https://hiringcafe.com/*",
+        "https://*.hiringcafe.com/*",
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*"
+      ],
+      "js": [
+        "fiber-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://jobright.ai/*",
+        "https://*.jobright.ai/*"
+      ],
+      "js": [
+        "jobright-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*"
+      ],
+      "js": [
+        "ch-main.js"
+      ],
+      "world": "MAIN",
       "run_at": "document_idle"
     }
   ]

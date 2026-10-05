@@ -176,10 +176,14 @@
     aborted = false;
     const onListPage = !!document.querySelector("li.job");
     if (!onListPage) {
+      // The homepage has no jobs; they live on month pages. Name the real one.
+      const month = Array.from(document.querySelectorAll("a[href]")).map((a) => a.href).find((u) =>
+        /\/(january|february|march|april|may|june|july|august|september|october|november|december)-\d{4}\/?$/i.test(u));
       await send("SCRAPE_DONE", {
         error:
-          "No job list on this page. Open a monthly 'Who is hiring?' page " +
-          "(e.g. hnhiring.com/june-2026) and run again."
+          "No job list on this page. The homepage has none; jobs are on the monthly " +
+          "'Who is hiring?' pages" + (month ? " — open " + month : " (e.g. hnhiring.com/september-2026)") +
+          " and run again."
       });
       return;
     }
