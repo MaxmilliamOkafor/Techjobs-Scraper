@@ -2304,7 +2304,126 @@ async function inRun(options) {
 }
 // =================== end indeed.com adapter ===================
 
+// ===================== hiring.cafe search API =====================
+// When the URL carries the search (…?searchState={…}, as /classic does), ask
+// hiring.cafe's own search endpoint — the one its page calls — for every result,
+// page by page. Each job comes with its employer apply_url, so no cards, no
+// pagination clicks and no detail-page fetches are needed, whatever the layout.
+// Returns false (and the card scraper runs) if the endpoint can't be used.
+const HC_API_SIZE = 100, HC_API_MAX_PAGES = 100;
+function hcIsTarget() { return /(^|\.)(hiring\.cafe|hiringcafe\.com)$/i.test(location.hostname); }
+function hcSearchState() {
+  const raw = new URLSearchParams(location.search).get("searchState");
+  if (!raw) return null;
+  try { const s = JSON.parse(raw); return s && typeof s === "object" ? s : null; } catch (_) { return null; }
+}
+// First non-empty value under any of these keys, looking a few levels in.
+function hcPick(o, keys, depth = 0) {
+  if (!o || typeof o !== "object" || depth > 3) return "";
+  for (const k of keys) {
+    const v = o[k];
+    if (v != null && v !== "" && typeof v !== "object") return v;
+    if (Array.isArray(v) && v.length && typeof v[0] !== "object") return v.join(", ");
+  }
+  for (const k in o) {
+    const v = o[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) { const r = hcPick(v, keys, depth + 1); if (r !== "") return r; }
+  }
+  return "";
+}
+function hcMoney(n, cur) {
+  const sym = { EUR: "€", GBP: "£", USD: "$" }[String(cur || "").toUpperCase()] || (cur ? cur + " " : "");
+  return sym + (n >= 1000 ? Math.round(n / 1000) + "k" : String(n));
+}
+function hcSalary(j) {
+  const cur = hcPick(j, ["listed_compensation_currency", "compensation_currency", "currency"]);
+  for (const [lo, hi, per] of [["yearly_min_compensation", "yearly_max_compensation", "/yr"], ["monthly_min_compensation", "monthly_max_compensation", "/mo"], ["hourly_min_compensation", "hourly_max_compensation", "/hr"]]) {
+    const a = +hcPick(j, [lo]) || 0, b = +hcPick(j, [hi]) || 0;
+    if (a || b) return (a && b && a !== b ? hcMoney(a, cur) + "–" + hcMoney(b, cur) : hcMoney(a || b, cur)) + per;
+  }
+  return "";
+}
+function hcAge(d) {
+  const t = Date.parse(d);
+  if (!t) return "";
+  const h = Math.max(0, Math.round((Date.now() - t) / 3600000));
+  return h < 24 ? h + "h" : h < 24 * 14 ? Math.round(h / 24) + "d" : Math.round(h / 168) + "w";
+}
+async function hcApiPost(path, body) {
+  try {
+    const r = await fetch(location.origin + path, { method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch (_) { return null; }
+}
+function hcResults(data) {
+  if (Array.isArray(data)) return data;
+  if (!data || typeof data !== "object") return null;
+  for (const k of ["results", "jobs", "data", "items", "content"]) if (Array.isArray(data[k])) return data[k];
+  if (data.hits && Array.isArray(data.hits.hits)) return data.hits.hits.map((h) => h._source || h);
+  return null;
+}
+async function hcApiRun() {
+  const searchState = hcSearchState();
+  if (!searchState) return false;
+  aborted = false;
+  const first = hcResults(await hcApiPost("/api/search-jobs", { size: HC_API_SIZE, page: 0, searchState }));
+  if (!first || !first.length) return false;
+  const cnt = await hcApiPost("/api/search-jobs/get-total-count", { searchState });
+  const total = cnt && +cnt.total ? +cnt.total : 0;
+  const totalPages = total ? Math.min(HC_API_MAX_PAGES, Math.ceil(total / HC_API_SIZE)) : null;
+  const seen = new Set();
+  let count = 0, batch = first, page = 0;
+  while (batch && batch.length && !aborted) {
+    await send("PAGE_PROGRESS", { pageIndex: page + 1, totalPages, scrapedThisPage: count, status: "running" });
+    const rows = [];
+    for (const j of batch) {
+      const id = String(hcPick(j, ["id", "objectID", "requisition_id"]) || "");
+      const apply = String(hcPick(j, ["apply_url", "applyUrl", "external_apply_url"]) || "");
+      const key = id || apply;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const view = id ? location.origin + "/viewjob/" + encodeURIComponent(id) : "";
+      const yoe = hcPick(j, ["min_industry_and_role_yoe", "min_yoe"]);
+      rows.push({ apply, view, row: {
+        url: "", title: String(hcPick(j.job_information || {}, ["title"]) || hcPick(j, ["title", "job_title", "core_job_title"]) || ""),
+        company: String(hcPick(j, ["company_name"]) || hcPick(j.v5_processed_company_data || j.company || {}, ["name"]) || ""),
+        location: String(hcPick(j, ["formatted_workplace_location", "location", "formatted_address"]) || ""),
+        salary: hcSalary(j), work_mode: String(hcPick(j, ["workplace_type", "workplace_types"]) || ""),
+        commitment: String(hcPick(j, ["commitment", "commitment_type"]) || ""),
+        yoe: yoe !== "" ? yoe + "+ YOE" : "", posted_age: hcAge(hcPick(j, ["estimated_publish_date", "date_posted", "published_at"])),
+        description: "", skills: String(hcPick(j, ["technical_tools"]) || ""),
+        job_posting_initial_url: view, hiringcafe_viewall_url: view, status: "", method: "", scraped_at: new Date().toISOString() } });
+    }
+    // apply_url is in the data: use it. Otherwise read it from the job's page.
+    let next = 0;
+    const work = async () => {
+      while (next < rows.length && !aborted) {
+        const { apply, view, row } = rows[next++];
+        if (isResolvedExternalUrl(apply)) { row.url = apply; row.status = "ok"; row.method = "hc-search-api"; }
+        else if (view) {
+          const r = await send("RESOLVE_URL", { url: view });
+          if (r && r.ok && isResolvedExternalUrl(r.finalUrl)) { row.url = r.finalUrl; row.status = "ok"; row.method = r.method || "detail"; }
+          else row.status = "unresolved: " + ((r && r.error) || "no apply_url in search data");
+        } else row.status = "no apply_url in search data";
+        await send("JOB_SCRAPED", { row });
+        count += 1;
+      }
+    };
+    await Promise.all(Array.from({ length: 6 }, work));
+    page += 1;
+    if (batch.length < HC_API_SIZE || page >= HC_API_MAX_PAGES || (total && seen.size >= total)) break;
+    batch = hcResults(await hcApiPost("/api/search-jobs", { size: HC_API_SIZE, page, searchState }));
+  }
+  await send("PAGE_PROGRESS", { pageIndex: page, totalPages, scrapedThisPage: count, status: "running" });
+  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+  return true;
+}
+// =================== end hiring.cafe search API ===================
+
 async function runScrape(options) {
+  if (hcIsTarget() && (await hcApiRun())) return;
   if (liIsTarget()) { return liRun(options); }
   if (inIsTarget()) { return inRun(options); }
   if (jrIsTarget()) { return jrRun(options); }
