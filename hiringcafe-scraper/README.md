@@ -12,7 +12,10 @@ Although this started as a hiring.cafe scraper, the extension now recognises sev
 - **careerhound.io** — dedicated adapter. Career Hound renders results as a card grid where each card's **Apply** link already points at the final external employer / ATS URL (Oracle Cloud, Comeet, BambooHR, Taleo, Greenhouse, gov.uk, ...), so no redirect resolution is needed. All fields are read directly off the card and it walks the standard Previous / Next pager (cards fully replace on each page). Just open your filtered search on `careerhound.io/search?...`, click **Start scraping**, and export the CSV.
 - **eurotoptech.com** — dialog-based adapter (opens each card to read its detail panel).
 - **simplify.jobs** — reads job data from the page's React state and follows the apply redirect in a background tab.
+- **jobright.ai** — dedicated adapter for `/jobs/recommend` (and Liked / Applied / External tabs). Jobright's list is a *virtualised* infinite scroll inside an inner scroll panel (only ~10 cards exist in the DOM at once), so the adapter scrolls that panel itself, collects every card by its job id, and exports the **real employer apply URL** (Greenhouse, Workday, iCIMS, ...) — read from the page's own list-API responses, or from each job's detail page as a fallback. Pagination strategy doesn't matter here (it's always infinite scroll); a picked *Jobs Column* scopes to that list, and a picked *Load more* button is clicked at the bottom if present. Reload the jobright tab once after installing/updating the extension so the API listener is in place.
 - **hnhiring.com** — Hacker News "Who is hiring" ATS-link extractor.
+- **LinkedIn** — open a job search (`linkedin.com/jobs/search-results/…` or the classic `linkedin.com/jobs/search/…`). Reads each job in the list (scrolling each into view, since LinkedIn only draws items near the screen), then gets the employer's apply link from the job's own data. **Easy Apply** jobs have no employer link and are flagged instead. Follows LinkedIn's Next-page button; apply links are fetched 4 at a time while the next page loads (about 50 jobs in 5 seconds); if LinkedIn returns a rate-limit response the scraper pauses and slows down automatically.
+- **Indeed** — open a job search on any Indeed country site (`indeed.com/jobs?q=…`, `uk.indeed.com`, `ie.indeed.com`, …). Reads the results list the page embeds; for jobs that apply on the company's site, follows Indeed's apply link to the employer's page. **Easily apply** jobs are flagged. Later result pages are fetched without leaving the tab. If Indeed asks for a human check, the run stops and says so — complete the check and run again.
 
 ## Features
 
@@ -40,7 +43,7 @@ Although this started as a hiring.cafe scraper, the extension now recognises sev
    - **Pagination** (default) — works for hiring.cafe's normal numbered-page UI; auto-detects the next button.
    - **Load More** — required when the page has a "Show more results" button instead of pages.
    - **Auto-scroll** — for infinite-scroll feeds.
-4. *(Optional but recommended for Load More)* Click **Pick element**, then on the page **hover** over the Next / Load More / `>` button, and **click** it to lock it in. Press Escape to cancel. The picker overlay shows you which element it's about to capture.
+4. *(Optional but recommended for Load More)* Click **Pick element**, then on the page **hover** over the Next / Load More / `>` button, and **click** it to lock it in. Press Escape to cancel. The picker overlay shows you which element it's about to capture. Picks are saved **per site** by default (each site remembers its own column and button); switch *Save picks* to **All sites** to use one shared pick everywhere.
 5. Click **Start scraping**. Watch the popup:
    - **Page** — current / total
    - **Scraped** — total jobs captured so far

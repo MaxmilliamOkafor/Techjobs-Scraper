@@ -9,12 +9,15 @@ const RESULTS_KEY = "hiringcafe_results";
 // Sites this extension can scrape. Add new sites here to extend support.
 const SITE_MATCHES = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://hiringcafe.com/*", "https://*.hiringcafe.com/*",   // hiring.cafe now redirects here
+  "https://jobright.ai/*", "https://*.jobright.ai/*",
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
-  "https://hnhiring.com/*", "https://*.hnhiring.com/*"
+  "https://hnhiring.com/*", "https://*.hnhiring.com/*",
+  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com|indeed\.com)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
@@ -24,7 +27,7 @@ const MAX_CONCURRENT_TABS = 2;
 const DETAIL_LOAD_TIMEOUT_MS = 15000;
 const DETAIL_APPLY_POLL_INTERVAL_MS = 250;
 const DETAIL_APPLY_POLL_MAX_ATTEMPTS = 60;
-const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe"]);
+const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe", "hiringcafe.com", "www.hiringcafe.com"]);
 // simplify.jobs job links are /jobs/click/{id} — an HTTP 302 to the employer
 // ATS that must be followed in a tab (the cross-origin hop isn't fetch-readable).
 const CLICK_REDIRECT_HOSTS = new Set(["simplify.jobs", "www.simplify.jobs"]);
@@ -151,6 +154,8 @@ async function fetchFollow(url) {
       signal: ctrl.signal
     });
     clearTimeout(timer);
+    // Only the final URL is needed: stop downloading the page body.
+    try { ctrl.abort(); } catch (_) {}
     return { ok: true, finalUrl: resp.url || url };
   } catch (e) {
     clearTimeout(timer);
@@ -322,7 +327,7 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
       if (!href || !/^https?:/i.test(href)) return false;
       try {
         const u = new URL(href, window.location.href);
-        return !/(^|\.)hiring\.cafe$/i.test(u.host);
+        return !/(^|\.)(hiring\.cafe|hiringcafe\.com)$/i.test(u.host);
       } catch (_) { return false; }
     }
     function check() {
@@ -545,7 +550,18 @@ async function resolveJobUrl(initialUrl) {
         state.fetchHits += 1;
         return { ok: true, finalUrl: cleanFinalUrl(cf.finalUrl), applyInitial: initialUrl, method: "click-fetch" };
       }
-      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "needs JS redirect"), method: "no-tab" };
+      // Fallback: the job's posting page (/p/<id>) — confirmed to load after the
+      // Sept 2026 redesign — embeds the job data, including where to apply.
+      // Pull the employer link out of its HTML the same way hiring.cafe's is.
+      const m = initialUrl.match(/\/jobs\/click\/([A-Za-z0-9-]+)/);
+      if (m && !cancelAll) {
+        const pf = await resolveHiringCafeApplyUrl("https://simplify.jobs/p/" + m[1]);
+        if (pf.ok && pf.finalUrl && !SITE_HOST_RE.test(hostOf(pf.finalUrl))) {
+          state.fetchHits += 1;
+          return { ok: true, finalUrl: cleanFinalUrl(pf.finalUrl), applyInitial: initialUrl, method: "posting-page" };
+        }
+      }
+      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "click redirect stayed on simplify; posting page had no apply link"), method: "no-tab" };
     }
 
     // Everything else — plain fetch with HTTP redirect following.
@@ -581,15 +597,27 @@ async function findTargetTab(preferTabId) {
 }
 function siteLabelFor(url) {
   const h = hostOf(url);
-  if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/(hiring\.cafe|hiringcafe\.com)$/i.test(h)) return "hiring.cafe";
+  if (/jobright\.ai$/i.test(h)) return "jobright.ai";
   if (/careerhound\.io$/i.test(h)) return "careerhound.io";
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
   if (/simplify\.jobs$/i.test(h)) return "simplify.jobs";
   if (/hnhiring\.com$/i.test(h)) return "hnhiring.com";
+  if (/linkedin\.com$/i.test(h)) return "linkedin.com";
+  if (/indeed\.com$/i.test(h)) return "indeed.com";
   return h || null;
 }
 // Which content script handles a given tab. hnhiring.com is served by its own
 // dedicated handler; all other supported sites share content.js.
+// The MAIN-world page helper each site needs (reads data only the page can see).
+function mainHelperFor(url) {
+  const h = hostOf(url);
+  if (/jobright\.ai$/i.test(h)) return "jobright-main.js";
+  if (/careerhound\.io$/i.test(h)) return "ch-main.js";
+  if (/simplify\.jobs$/i.test(h)) return "sj-main.js";
+  if (/(hiring\.cafe|hiringcafe\.com)$/i.test(h)) return "fiber-main.js";
+  return null;
+}
 function contentScriptFor(url) {
   return /hnhiring\.com$/i.test(hostOf(url)) ? "hnhiring.js" : "content.js";
 }
@@ -606,7 +634,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_SCRAPE": {
           const target = await findTargetTab();
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
@@ -615,9 +643,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           state.site = siteLabelFor(target.url);
           state.fetchHits = 0; state.tabHits = 0;
           persistState();
+          // Make sure the tab's MAIN-world page helper is there BEFORE the scrape
+          // starts. Chrome only adds it when a page loads, so a tab that was open
+          // before the extension was installed or updated has none, and the
+          // scraper can read nothing. Injecting on every Start is safe: each
+          // helper ignores a second copy of itself.
+          const helper = mainHelperFor(target.url);
+          if (helper) {
+            await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [helper], world: "MAIN" })
+              .catch((e) => console.warn("page helper inject failed", e));
+          }
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
             .catch(async () => {
               try {
+                // Content script missing too (tab predates the extension): add it.
                 await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [contentScriptFor(target.url)] });
                 await chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} });
               } catch (e2) {
@@ -672,7 +711,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "START_PICKER": {
           const target = await findTargetTab(msg.tabId);
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first." }); return; }
           try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {
@@ -683,6 +722,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               return;
             }
           }
+          sendResponse({ ok: true });
+          return;
+        }
+        case "PICKER_CANCELLED": {
+          chrome.runtime.sendMessage({ type: "PICKER_CANCELLED", mode: msg.mode }).catch(() => {});
           sendResponse({ ok: true });
           return;
         }

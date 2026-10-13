@@ -11,7 +11,7 @@
     <div class="logo" aria-hidden="true">TJ</div>
     <div>
       <h1>Tech Jobs Scraper</h1>
-      <p class="sub">hiring.cafe, careerhound.io, eurotoptech, simplify &amp; hnhiring.com — job &amp; URL scraper</p>
+      <p class="sub">hiring.cafe, jobright.ai, careerhound.io, eurotoptech, simplify, hnhiring.com, LinkedIn &amp; Indeed — job &amp; URL scraper</p>
     </div>
   </header>
 
@@ -70,28 +70,45 @@
     </div>
 
     <div id="picker-block">
+      <div class="card-title small">Save picks</div>
+      <div class="pick-scope-row">
+        <label><input type="radio" name="pick-scope" value="site" checked /> Per site</label>
+        <label><input type="radio" name="pick-scope" value="all" /> All sites</label>
+      </div>
+      <div id="pick-site" class="pick-site"></div>
+
       <div class="card-title small">Pick Jobs Column</div>
       <ol class="picker-steps">
         <li><b>Hover</b> a job card / row you want to scrape.</li>
-        <li><b>Click</b> to lock it in. Esc cancels.</li>
+        <li><b>Click</b> to lock it in. Esc or <b>Un-pick</b> cancels.</li>
       </ol>
       <div class="picker-row">
         <button id="pick-btn" class="secondary">Pick element</button>
-        <button id="pick-clear-btn" class="ghost" disabled>Clear</button>
+        <button id="pick-clear-btn" class="ghost" disabled title="Remove the picked column (or cancel picking)">Un-pick</button>
       </div>
       <div id="picker-result" class="picker-result picker-empty">No element selected — auto-detect will be used.</div>
 
       <div class="card-title small">Pick Pagination Button</div>
       <ol class="picker-steps">
         <li><b>Hover</b> any "Load More" / "Next Page" / &gt; button.</li>
-        <li><b>Click</b> to lock it in. Esc cancels.</li>
+        <li><b>Click</b> to lock it in. Esc or <b>Un-pick</b> cancels.</li>
       </ol>
       <div class="picker-row">
         <button id="pick-pagination-btn" class="secondary">Pick element</button>
-        <button id="pick-pagination-clear-btn" class="ghost" disabled>Clear</button>
+        <button id="pick-pagination-clear-btn" class="ghost" disabled title="Remove the picked button (or cancel picking)">Un-pick</button>
       </div>
       <div id="picker-pagination-result" class="picker-result picker-empty">No element selected — auto-detect will be used.</div>
     </div>
+  </section>
+
+  <section id="diag-card">
+    <div class="card-title">Diagnostics</div>
+    <p class="hint">Scraper not finding jobs or URLs on a site? Capture the page
+      structure and paste it to whoever is fixing the selectors.</p>
+    <div class="actions csv-actions">
+      <button id="diag-btn" class="secondary">Copy page structure</button>
+    </div>
+    <pre id="diag-log" class="csv-log" aria-live="polite"></pre>
   </section>
 
   <section id="csv-card">
@@ -102,7 +119,7 @@
     <input type="file" id="csv-file-input" accept=".csv,.txt" multiple hidden />
     <pre id="csv-summary" class="csv-summary" aria-live="polite"></pre>
     <div class="actions csv-actions">
-      <button id="csv-start-btn" class="primary" disabled>Add to LazyApply Queue</button>
+      <button id="csv-start-btn" class="primary">Add to LazyApply Queue</button>
       <button id="csv-stop-btn" class="ghost" disabled>Stop</button>
     </div>
     <div class="progress-track" role="progressbar" aria-label="Queue add progress">
@@ -147,11 +164,14 @@
   <footer>
     <p class="hint">
       Open
-      <a id="open-hc" href="https://hiring.cafe/" target="_blank" rel="noopener">hiring.cafe</a>
+      <a id="open-hc" href="https://hiringcafe.com/" target="_blank" rel="noopener">hiring.cafe</a>
+      <a href="https://jobright.ai/jobs/recommend" target="_blank" rel="noopener">jobright.ai</a>,
       <a href="https://careerhound.io/" target="_blank" rel="noopener">careerhound.io</a>,
       <a href="https://eurotoptech.com/" target="_blank" rel="noopener">eurotoptech</a>,
       <a href="https://simplify.jobs/" target="_blank" rel="noopener">simplify</a>,
-      or <a href="https://hnhiring.com/" target="_blank" rel="noopener">hnhiring.com</a>,
+      <a href="https://hnhiring.com/" target="_blank" rel="noopener">hnhiring.com</a>,
+      <a href="https://www.linkedin.com/jobs/search/" target="_blank" rel="noopener">LinkedIn</a>,
+      or <a href="https://www.indeed.com/" target="_blank" rel="noopener">Indeed</a>,
       then hit <b>Start scraping</b>.
     </p>
   </footer>
