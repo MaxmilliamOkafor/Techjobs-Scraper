@@ -1,0 +1,131 @@
+{
+  "manifest_version": 3,
+  "name": "Tech Jobs URL Scraper",
+  "version": "2.12.6",
+  "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, linkedin.com and indeed.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "scripting",
+    "activeTab",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://hiring.cafe/*",
+    "https://*.hiring.cafe/*",
+    "https://hiringcafe.com/*",
+    "https://*.hiringcafe.com/*",
+    "https://eurotoptech.com/*",
+    "https://*.eurotoptech.com/*",
+    "https://simplify.jobs/*",
+    "https://*.simplify.jobs/*",
+    "https://hnhiring.com/*",
+    "https://*.hnhiring.com/*",
+    "https://app.lazyapply.com/*",
+    "https://jobright.ai/*",
+    "https://*.jobright.ai/*",
+    "https://careerhound.io/*",
+    "https://*.careerhound.io/*",
+    "https://www.linkedin.com/*",
+    "https://indeed.com/*",
+    "https://*.indeed.com/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Tech Jobs Scraper"
+  },
+  "side_panel": {
+    "default_path": "popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://jobright.ai/*",
+        "https://*.jobright.ai/*",
+        "https://hiring.cafe/*",
+        "https://*.hiring.cafe/*",
+        "https://hiringcafe.com/*",
+        "https://*.hiringcafe.com/*",
+        "https://eurotoptech.com/*",
+        "https://*.eurotoptech.com/*",
+        "https://simplify.jobs/*",
+        "https://*.simplify.jobs/*",
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*",
+        "https://www.linkedin.com/jobs/*",
+        "https://indeed.com/*",
+        "https://*.indeed.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://simplify.jobs/*",
+        "https://*.simplify.jobs/*"
+      ],
+      "js": [
+        "sj-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://hnhiring.com/*",
+        "https://*.hnhiring.com/*"
+      ],
+      "js": [
+        "hnhiring.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://hiring.cafe/*",
+        "https://*.hiring.cafe/*",
+        "https://hiringcafe.com/*",
+        "https://*.hiringcafe.com/*",
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*"
+      ],
+      "js": [
+        "fiber-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://jobright.ai/*",
+        "https://*.jobright.ai/*"
+      ],
+      "js": [
+        "jobright-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://careerhound.io/*",
+        "https://*.careerhound.io/*"
+      ],
+      "js": [
+        "ch-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    }
+  ]
+}
