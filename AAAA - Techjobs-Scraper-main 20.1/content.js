@@ -928,6 +928,39 @@ function ettBuildRow(dlg) {
     scraped_at: new Date().toISOString()
   };
 }
+// The Apply href is now eurotoptech's own redirect (/api/jobs/apply/<id>), not
+// the ATS link. Hand it to the background worker, which follows the redirect to
+// the employer site. The scrape keeps clicking cards while lookups run (a few at
+// a time); rows are saved once resolved, and every lookup is awaited before the
+// scrape reports done. Unresolved rows get a blank Job URL, never an eurotoptech one.
+const ETT_MAX_PENDING_RESOLVES = 4;
+const ettPendingResolves = new Set();
+async function ettResolveAndSave(row) {
+  const initial = row.url;
+  if (initial && !isResolvedExternalUrl(initial)) {
+    const r = await send("RESOLVE_URL", { url: initial });
+    if (r && r.ok && r.finalUrl && isResolvedExternalUrl(r.finalUrl)) {
+      row.url = ettCleanUrl(r.finalUrl);
+      row.ats_provider = ettProvider(row.url);
+      row.status = "ok";
+      row.method = "apply-redirect:" + (r.method || "resolved");
+    } else {
+      row.url = "";
+      row.ats_provider = "";
+      row.status = "unresolved: " + ((r && r.error) || "redirect lookup failed");
+      row.method = "apply-redirect:failed";
+    }
+  }
+  await send("JOB_SCRAPED", { row });
+}
+async function ettQueueRow(row) {
+  while (ettPendingResolves.size >= ETT_MAX_PENDING_RESOLVES) await Promise.race(ettPendingResolves);
+  const p = ettResolveAndSave(row).catch(() => {}).finally(() => ettPendingResolves.delete(p));
+  ettPendingResolves.add(p);
+}
+async function ettDrainResolves() {
+  while (ettPendingResolves.size) await Promise.allSettled(Array.from(ettPendingResolves));
+}
 // Card-only fallback row (dialog failed to open): read what the card shows.
 function ettRowFromCard(card, status) {
   const lines = Array.from(card.querySelectorAll(":scope > div")).map(visibleText).filter(Boolean);
@@ -1010,7 +1043,7 @@ async function ettScrapePage(pageIndex, totalPages, columnSpec) {
     const opened = await ettWaitDialogOrPaywall(title);
     if (opened.paywall) { ettDismissPaywall(opened.paywall); ettPaywalled = true; return; }
     if (opened.dlg) {
-      await send("JOB_SCRAPED", { row: ettBuildRow(opened.dlg) });
+      await ettQueueRow(ettBuildRow(opened.dlg));
       ettCloseDialog();
       await ettWaitNoDialog();
     } else {
@@ -1050,6 +1083,7 @@ async function ettRun(options) {
     const prevFirstTitle = ettCardTitle(ettGetCards(columnSpec)[0]);
     await ettScrapePage(pageIndex, totalPages, columnSpec);
     if (ettPaywalled) {
+      await ettDrainResolves();
       await send("SCRAPE_DONE", { error: "EuroTopTech showed a membership prompt instead of the job details. Log in with a member account, open eurotoptech.com/jobs, and run again." });
       return;
     }
@@ -1063,6 +1097,7 @@ async function ettRun(options) {
     const changed = await ettWaitForCardChange(prevFirstTitle, columnSpec);
     if (!changed) break;
   }
+  await ettDrainResolves();
   await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
 }
 // =================== end eurotoptech.com adapter ===================

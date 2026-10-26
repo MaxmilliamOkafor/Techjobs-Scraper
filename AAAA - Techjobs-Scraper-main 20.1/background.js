@@ -31,6 +31,8 @@ const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe", "hiringcafe.co
 // simplify.jobs job links are /jobs/click/{id} — an HTTP 302 to the employer
 // ATS that must be followed in a tab (the cross-origin hop isn't fetch-readable).
 const CLICK_REDIRECT_HOSTS = new Set(["simplify.jobs", "www.simplify.jobs"]);
+// eurotoptech.com apply links are /api/jobs/apply/{id} — an HTTP redirect to the employer ATS.
+const ETT_HOST_RE = /(^|\.)eurotoptech\.com$/i;
 
 let state = {
   status: "idle", pageIndex: 0, totalPages: null,
@@ -562,6 +564,27 @@ async function resolveJobUrl(initialUrl) {
         }
       }
       return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "click redirect stayed on simplify; posting page had no apply link"), method: "no-tab" };
+    }
+
+    // eurotoptech.com — the dialog's "Apply" href is now an internal redirect
+    // endpoint (/api/jobs/apply/<id>) that 302s to the employer ATS. The page
+    // can't follow it (cross-origin), but the service worker can. If fetch ends
+    // up still on eurotoptech (e.g. a login/JS hop), follow it in a hidden tab.
+    if (ETT_HOST_RE.test(startHost)) {
+      const ef = await fetchFollow(initialUrl);
+      if (ef.ok && ef.finalUrl && !ETT_HOST_RE.test(hostOf(ef.finalUrl))) {
+        state.fetchHits += 1;
+        return { ok: true, finalUrl: cleanFinalUrl(ef.finalUrl), applyInitial: initialUrl, method: "ett-fetch" };
+      }
+      if (cancelAll) return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "cancelled", method: "none" };
+      await tabSem.acquire();
+      let tr;
+      try { tr = await resolveByTab(initialUrl); } finally { tabSem.release(); }
+      if (tr.ok && tr.finalUrl && !ETT_HOST_RE.test(hostOf(tr.finalUrl))) {
+        state.tabHits += 1;
+        return { ok: true, finalUrl: cleanFinalUrl(tr.finalUrl), applyInitial: initialUrl, method: "ett-tab" };
+      }
+      return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "eurotoptech apply link did not leave eurotoptech (" + (tr.error || ef.error || "stayed on site") + ")", method: "ett-unresolved" };
     }
 
     // Everything else — plain fetch with HTTP redirect following.
