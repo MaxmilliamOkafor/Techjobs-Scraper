@@ -42,14 +42,27 @@
   }
 
   // Injected into the LazyApply tab. Removes UP TO maxPerCall matching rows per
-  // call. Batching matters: scanning every button + every <tbody tr> is O(queue
-  // size), so doing it once per row (with a 1ms gap) meant tens of thousands of
-  // full-table scans on a large queue — which pegged the CPU and crashed the tab.
-  // One scan now covers a whole batch, and waiting for a removal uses a cheap
-  // node-detached check with backoff instead of re-counting rows every 5ms.
+  // call. Speed: every matching "Remove" on screen is clicked in one go (the
+  // clicks all land before the page re-renders, so each one hits its own row),
+  // then the whole batch is awaited together — instead of one row, one wait,
+  // one row. Waiting uses a cheap node-detached check with backoff, so a big
+  // queue never pegs the CPU (an earlier 5ms full-table poll crashed the tab).
   async function removeRowsInPage(filters, maxPerCall) {
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    const rowText = (tr) => (tr.innerText || "").replace(/\s+/g, " ").trim();
+    // textContent, not innerText: no layout work, so scanning a big table is cheap.
+    const rowText = (tr) => (tr.textContent || "").replace(/\s+/g, " ").trim();
+    // A row's identity: React's key for it (the job), else its text. Runs in the
+    // page's own world so React's fields on the row are visible.
+    const rowId = (tr) => {
+      const fk = Object.keys(tr).find((k) => k.startsWith("__reactFiber$"));
+      for (let f = fk && tr[fk], i = 0; f && i < 4; f = f.return, i++) if (f.key != null) return "k:" + f.key;
+      return "t:" + rowText(tr);
+    };
+    const labelCounts = () => {
+      const m = new Map();
+      for (const tr of document.querySelectorAll("tbody tr")) { const t = rowId(tr); m.set(t, (m.get(t) || 0) + 1); }
+      return m;
+    };
     const matches = (tr) => {
       if (!filters || !filters.length) return true;
       const t = rowText(tr).toLowerCase();
@@ -61,37 +74,45 @@
       );
     const rowCount = () => document.querySelectorAll("tbody tr").length;
 
-    // Wait for a node to leave the DOM. document.body.contains() is a cheap
-    // tree walk with no querySelectorAll, and the interval backs off so a slow
-    // removal costs a handful of checks rather than hundreds.
-    async function waitDetached(node, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      let iv = 10;
-      while (document.body.contains(node)) {
-        if (Date.now() >= deadline) return false;
-        await sleep(iv);
-        if (iv < 120) iv = Math.min(120, Math.round(iv * 1.6));
-      }
-      return true;
-    }
-
-    const removed = [];
-    let unconfirmed = 0;
-    // ONE scan for the whole batch. Removing a row leaves the other rows' nodes
-    // intact, so the snapshot stays valid; stale entries are simply skipped.
-    const btns = removeButtons();
-    for (const b of btns) {
-      if (removed.length >= maxPerCall) break;
-      if (!document.body.contains(b)) continue;
+    // ONE scan, then click the whole batch before the page can re-render.
+    const before = labelCounts();
+    const clicked = [], want = new Map(), labels = new Map();   // row id -> how many we removed
+    for (const b of removeButtons()) {
+      if (clicked.length >= maxPerCall) break;
       const tr = b.closest("tr");
       if (!tr || !matches(tr)) continue;
-      const label = rowText(tr).slice(0, 80);
+      const id = rowId(tr);
       try { b.click(); } catch (_) { continue; }
-      if (!(await waitDetached(b, 2500))) unconfirmed += 1;
-      removed.push(label);
+      clicked.push(id);
+      want.set(id, (want.get(id) || 0) + 1);
+      labels.set(id, rowText(tr).slice(0, 80));
     }
+    // A row is confirmed gone when fewer rows with its text remain — checked by
+    // content, not by node, because the table may redraw every row. The whole
+    // batch is awaited together, polling 10ms -> 150ms.
+    const goneOf = (now) => {
+      let n = 0;
+      for (const [t, k] of want) n += Math.min(k, Math.max(0, (before.get(t) || 0) - (now.get(t) || 0)));
+      return n;
+    };
+    const deadline = Date.now() + 2500 + clicked.length * 60;
+    let iv = 10, gone = 0;
+    while (clicked.length && Date.now() < deadline) {
+      await sleep(iv);
+      if (iv < 150) iv = Math.min(150, Math.round(iv * 1.6));
+      gone = goneOf(labelCounts());
+      if (gone >= clicked.length) break;
+    }
+    // Which labels to report: the first `gone` of each text that went.
+    const removed = [];
+    const now = labelCounts();
+    for (const [t, k] of want) {
+      const g = Math.min(k, Math.max(0, (before.get(t) || 0) - (now.get(t) || 0)));
+      for (let i = 0; i < g; i++) removed.push(labels.get(t));
+    }
+    const unconfirmed = clicked.length - removed.length;
 
-    if (removed.length === 0) {
+    if (clicked.length === 0) {
       // Nothing matched on screen — try to reveal more rows before declaring done.
       const showMore = Array.from(document.querySelectorAll("button")).find(
         (b) => /show more/i.test(b.textContent || "") && !b.disabled && b.offsetParent !== null
@@ -110,7 +131,7 @@
       }
       return { ok: true, done: true, removed: [], unconfirmed: 0, remaining: rowCount() };
     }
-    return { ok: true, done: false, removed, unconfirmed, remaining: rowCount() };
+    return { ok: true, done: false, removed, unconfirmed, clicked: clicked.length, remaining: rowCount() };
   }
 
   function parseFilters() {
@@ -128,8 +149,8 @@
       log("⚠ Filter mode is on but no filter text was entered. Try: lever, dandy"); return;
     }
 
-    const DELETE_BATCH = 25;   // rows removed per injected call (amortises DOM scans)
-    let pace = 10;             // ms between batches; adapts if the page struggles
+    let batchSize = 100;       // rows clicked per injected call; halves if LazyApply lags
+    let pace = 0;              // ms between batches; adapts if the page struggles
     const rawMax = parseInt(els.maxInput?.value, 10);
     const maxDeletes = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : Infinity;
 
@@ -141,14 +162,13 @@
       ? '\u25b6 Deleting queue jobs matching: ' + filters.join(", ") + '\n'
       : '\u25b6 Deleting ALL queued jobs\n');
 
-    let removed = 0, emptyStreak = 0, failStreak = 0;
+    let removed = 0, emptyStreak = 0, failStreak = 0, stuckStreak = 0;
     while (!stopRequested && removed < maxDeletes) {
-      const want = Math.min(DELETE_BATCH, maxDeletes - removed);
+      const want = Math.min(batchSize, maxDeletes - removed);
       let res = null;
-      const t0 = Date.now();
-      try {
+        try {
         const [r] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id }, func: removeRowsInPage, args: [filters, want]
+          target: { tabId: tab.id }, world: "MAIN", func: removeRowsInPage, args: [filters, want]
         });
         res = r && r.result;
         failStreak = 0;
@@ -168,27 +188,31 @@
       if (!res || !res.ok) { log("\u2717 Unexpected page response \u2014 stopping."); break; }
 
       const batch = Array.isArray(res.removed) ? res.removed : [];
-      if (batch.length === 0) {
+      if (!res.clicked) {
         if (res.grew) { emptyStreak = 0; await sleep(pace); continue; }  // Show More revealed rows
         if (++emptyStreak >= 2) break;
         await sleep(pace);
         continue;
       }
       emptyStreak = 0;
-      for (const label of batch) {
-        removed += 1;
-        log(removed + ". \u2713 " + label +
-          (Number.isFinite(maxDeletes) ? "   [" + removed + "/" + maxDeletes + "]" : ""));
-      }
-      if (res.unconfirmed) log("  (" + res.unconfirmed + " unconfirmed in this batch)");
+      // Rows that were clicked but never went away, call after call: give up
+      // rather than clicking the same Remove buttons forever.
+      if (!batch.length) {
+        if (++stuckStreak >= 4) { log("\u2717 LazyApply is not removing jobs any more \u2014 stopping. Reload the dashboard and try again."); break; }
+      } else stuckStreak = 0;
+      // One log write per batch (appending line by line is slow on a big queue).
+      const lines = batch.map((label, i) => (removed + i + 1) + ". \u2713 " + label +
+        (Number.isFinite(maxDeletes) ? "   [" + (removed + i + 1) + "/" + maxDeletes + "]" : ""));
+      removed += batch.length;
+      if (res.unconfirmed) lines.push("  (" + res.unconfirmed + " still showing \u2014 retrying)");
+      if (lines.length) log(lines.join("\n"));
       if (Number.isFinite(maxDeletes)) setProgress(removed / maxDeletes);
 
-      // Adaptive pacing: if the page is slow to remove rows, give it more room;
-      // if it is keeping up, tighten back toward the floor.
-      const perRow = (Date.now() - t0) / batch.length;
-      if (res.unconfirmed || perRow > 250) pace = Math.min(500, Math.round(pace * 2) + 10);
-      else pace = Math.max(10, pace - 10);
-      await sleep(pace);
+      // Adaptive: if LazyApply can't keep up (rows left behind), halve the
+      // batch and add a pause; while it keeps up, grow back to full speed.
+      if (res.unconfirmed > res.clicked / 2) { batchSize = Math.max(5, batchSize >> 1); pace = Math.min(1500, pace * 2 + 100); }
+      else { batchSize = Math.min(100, batchSize * 2); pace = Math.max(0, pace >> 1); }
+      if (pace) await sleep(pace);
     }
 
     setProgress(1); running = false; els.stopBtn.disabled = true;
