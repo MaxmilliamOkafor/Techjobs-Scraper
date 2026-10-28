@@ -292,6 +292,14 @@ footer {
 .hint a { color: #d8b4fe; text-decoration: none; }
 .hint a:hover { text-decoration: underline; }
 
+/* LazyApply Queue → Show All Jobs */
+#showall-card {
+  margin: 8px 16px; padding: 12px 14px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+}
+#showall-card .hint { margin-bottom: 2px; }
+.showall-urls { max-height: 220px; white-space: pre; overflow-x: auto; color: var(--text); }
+
 /* LazyApply Queue → Mass Delete */
 #cleanup-card {
   margin: 8px 16px; padding: 12px 14px;

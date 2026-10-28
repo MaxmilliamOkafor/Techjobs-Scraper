@@ -11,9 +11,11 @@ const SITE_MATCH = [
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
   "https://hnhiring.com/*", "https://*.hnhiring.com/*",
-  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*"
+  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*",
+  "https://flexjobs.com/*", "https://*.flexjobs.com/*",
+  "https://notify.careers/*", "https://*.notify.careers/*"
 ];
-const ON_SITE_RE = /(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com\/jobs|indeed\.com)/;
+const ON_SITE_RE = /(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com\/jobs|indeed\.com|flexjobs\.com|notify\.careers)/;
 
 const els = {
   diagBtn: document.getElementById("diag-btn"),
@@ -111,7 +113,7 @@ function pickSiteKey(url) {
   let h = "";
   try { h = new URL(url).hostname.toLowerCase(); } catch (_) {}
   if (/(hiring\.cafe|hiringcafe\.com)$/.test(h)) return "hiring.cafe";
-  for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com"]) {
+  for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com", "flexjobs.com", "notify.careers"]) {
     if (h === s || h.endsWith("." + s)) return s;
   }
   return h.replace(/^www\./, "");
@@ -229,7 +231,7 @@ async function startPickerMode(mode) {
   els.errorRow.hidden = true;
   const tabs = await chrome.tabs.query({ url: SITE_MATCH });
   if (!tabs.length) {
-    els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first.";
+    els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search, an Indeed job search, a FlexJobs search or Notify (app.notify.careers/postings) in a tab first.";
     els.errorRow.hidden = false;
     return;
   }
@@ -293,7 +295,7 @@ els.startBtn.addEventListener("click", async () => {
   if (!onSite) {
     const tabs = await chrome.tabs.query({ url: SITE_MATCH });
     if (!tabs.length) {
-      els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search or an Indeed job search in a tab first.";
+      els.errorRow.textContent = "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search, an Indeed job search, a FlexJobs search or Notify (app.notify.careers/postings) in a tab first.";
       els.errorRow.hidden = false;
       els.startBtn.disabled = false;
       return;
@@ -316,16 +318,40 @@ els.startBtn.addEventListener("click", async () => {
 
 els.stopBtn.addEventListener("click", async () => { els.stopBtn.disabled = true; await send("STOP_SCRAPE"); await refresh(); });
 els.clearBtn.addEventListener("click", async () => { await send("CLEAR_RESULTS"); await refresh(); });
+// Reads the saved chunks straight from storage (a large run is too big to
+// pass as one message) and builds the CSV piece by piece.
 els.exportBtn.addEventListener("click", async () => {
-  const resp = await send("GET_RESULTS");
-  if (!resp || !resp.ok || !resp.results || resp.results.length === 0) {
+  const resp = await send("FLUSH_RESULTS");
+  if (!resp || !resp.ok || !resp.count) {
     els.errorRow.textContent = "No results to export yet.";
     els.errorRow.hidden = false;
     return;
   }
-  const csv = rowsToCsv(resp.results);
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  downloadCsv(csv, `tech-jobs-${stamp}.csv`);
+  els.exportBtn.disabled = true;
+  const label = els.exportBtn.textContent;
+  try {
+    const parts = [CSV_COLUMNS.map((c) => csvEscape(c.label)).join(",") + "\n"];
+    for (let i = 0; i < resp.chunks; i += 10) {
+      const keys = [];
+      for (let k = i; k < Math.min(resp.chunks, i + 10); k++) keys.push(resp.prefix + k);
+      const got = await chrome.storage.local.get(keys);
+      for (const key of keys) {
+        const rows = got[key] || [];
+        if (rows.length) parts.push(rows.map((r) => CSV_COLUMNS.map((c) => csvEscape(r[c.key])).join(",")).join("\n") + "\n");
+      }
+      els.exportBtn.textContent = `Exporting… ${Math.min(100, Math.round(((i + 10) / resp.chunks) * 100))}%`;
+    }
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const blob = new Blob(["\uFEFF", ...parts], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `tech-jobs-${stamp}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  } finally {
+    els.exportBtn.textContent = label;
+    els.exportBtn.disabled = false;
+  }
 });
 
 // ---- Diagnostics: capture the page structure for selector debugging --------

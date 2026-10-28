@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Tech Jobs URL Scraper",
-  "version": "2.12.7",
-  "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, linkedin.com and indeed.com (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue and can mass-delete jobs from the queue.",
+  "version": "2.17.0",
+  "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, linkedin.com, indeed.com, flexjobs.com and notify.careers (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue can show every job in the queue (auto Show More) with its URL, and can mass-delete jobs from the queue.",
   "permissions": [
     "tabs",
     "storage",
     "scripting",
     "activeTab",
-    "sidePanel"
+    "sidePanel",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "https://hiring.cafe/*",
@@ -29,6 +30,10 @@
     "https://www.linkedin.com/*",
     "https://indeed.com/*",
     "https://*.indeed.com/*",
+    "https://flexjobs.com/*",
+    "https://*.flexjobs.com/*",
+    "https://notify.careers/*",
+    "https://*.notify.careers/*",
     "<all_urls>"
   ],
   "background": {
@@ -62,7 +67,11 @@
         "https://*.careerhound.io/*",
         "https://www.linkedin.com/jobs/*",
         "https://indeed.com/*",
-        "https://*.indeed.com/*"
+        "https://*.indeed.com/*",
+        "https://flexjobs.com/*",
+        "https://*.flexjobs.com/*",
+        "https://notify.careers/*",
+        "https://*.notify.careers/*"
       ],
       "js": [
         "content.js"
@@ -126,6 +135,17 @@
       ],
       "world": "MAIN",
       "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://notify.careers/*",
+        "https://*.notify.careers/*"
+      ],
+      "js": [
+        "notify-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
     }
   ]
 }

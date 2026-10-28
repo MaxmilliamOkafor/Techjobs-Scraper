@@ -1,4 +1,4 @@
-// content.js — hiring.cafe + eurotoptech.com + simplify.jobs
+// content.js — hiring.cafe + eurotoptech.com + simplify.jobs + flexjobs.com + notify.careers
 // v2.3.0 — the exported "Job URL" column now only ever holds a resolved external
 //          ATS link; aggregator links (hiring.cafe/job/...) are never stored —
 //          unresolved rows are left blank and flagged in the status column.
@@ -10,12 +10,12 @@
   window.__hiringCafeScraperInjected__ = true;
 
   const PAGE_RENDER_TIMEOUT_MS = 12000;
-  const PAGE_RENDER_POLL_MS = 150;
-  const PAGE_QUIET_MS = 350;
-  const POST_CLICK_GRACE_MS = 200;
+  const PAGE_RENDER_POLL_MS = 80;
+  const PAGE_QUIET_MS = 250;
+  const POST_CLICK_GRACE_MS = 80;
   const APPEND_WAIT_TIMEOUT_MS = 12000;
   const SCROLL_STEP_PX = 1200;
-  const SCROLL_PAUSE_MS = 250;
+  const SCROLL_PAUSE_MS = 150;
   const APPEND_NO_GROWTH_TRIES = 4;
 
   let aborted = false;
@@ -26,7 +26,7 @@
   // Aggregator hosts that must NEVER survive into the exported "Job URL" column —
   // a real ATS link (greenhouse/lever/workday/etc.) is the only acceptable value.
   // If resolution returns one of these (or fails), the URL is treated as unresolved.
-  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|jobright\.ai)$/i;
+  const AGGREGATOR_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|jobright\.ai|flexjobs\.com|notify\.careers)$/i;
   function isResolvedExternalUrl(u) {
     if (!u || !/^https?:\/\//i.test(u)) return false;
     try { return !AGGREGATOR_HOST_RE.test(new URL(u).host); } catch (_) { return false; }
@@ -69,12 +69,27 @@
     let h = "";
     try { h = new URL(url).hostname.toLowerCase(); } catch (_) {}
     if (/(hiring\.cafe|hiringcafe\.com)$/.test(h)) return "hiring.cafe";
-    for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com"]) {
+    for (const s of ["jobright.ai", "careerhound.io", "eurotoptech.com", "simplify.jobs", "hnhiring.com", "linkedin.com", "indeed.com", "flexjobs.com", "notify.careers"]) {
       if (h === s || h.endsWith("." + s)) return s;
     }
     return h.replace(/^www\./, "");
   }
-  function send(type, payload = {}) {
+  // Link lookups that are still running while the scraper has already moved on
+  // to the next page. Every adapter's SCRAPE_DONE waits for them (see send).
+  const pendingWork = new Set();
+  function track(p) {
+    const q = Promise.resolve(p).catch(() => {}).finally(() => pendingWork.delete(q));
+    pendingWork.add(q);
+    return q;
+  }
+  async function drainPending() {
+    while (pendingWork.size) await Promise.allSettled(Array.from(pendingWork));
+  }
+  async function send(type, payload = {}) {
+    if (type === "SCRAPE_DONE") await drainPending();
+    return sendNow(type, payload);
+  }
+  function sendNow(type, payload = {}) {
     return new Promise((resolve) => {
       try {
         chrome.runtime.sendMessage({ type, ...payload }, (resp) => {
@@ -306,7 +321,19 @@
       return el.closest(JR_CARD_SEL);
     }
     if (typeof ettIsTarget === "function" && ettIsTarget()) {
-      return el.closest(".MuiCard-root");
+      return el.closest("article") || el.closest(".MuiCard-root");
+    }
+    if (typeof nfIsTarget === "function" && nfIsTarget()) {
+      // A Notify card: the grid child holding the job's title link.
+      const g = nfGrid();
+      let n = el;
+      while (n && n.parentElement && n.parentElement !== g) n = n.parentElement;
+      return n && n.parentElement === g ? n : null;
+    }
+    if (typeof fjIsTarget === "function" && fjIsTarget()) {
+      // A FlexJobs result row: the [data-index] box holding one job-name link.
+      const c = el.closest("[data-index]");
+      return c && c.querySelector('a[id^="job-name-"]') ? c : null;
     }
     if (typeof inIsTarget === "function" && inIsTarget()) {
       // A job card: the list row holding a job key, else the card box itself.
@@ -603,7 +630,9 @@
     // URL only there, so this resolves rows the network fetch never could.
     const fiber = await fiberRequestUrls();
     let completed = 0;
-    await Promise.all(rows.map(async (row) => {
+    // Rows are already read off the cards, so lookups keep running while the
+    // next page loads; SCRAPE_DONE waits for all of them.
+    track(Promise.all(rows.map(async (row) => {
       if (aborted) return;
       const fromFiber = row.job_posting_initial_url ? fiber.byHref.get(row.job_posting_initial_url) : null;
       if (fromFiber && isResolvedExternalUrl(fromFiber)) {
@@ -632,11 +661,11 @@
           pageIndex: currentPage, totalPages, scrapedThisPage: completed, status: "running"
         });
       }
-    }));
+    })));
   }
 
   // Hard safety cap so a misbehaving "next" control can never scrape forever.
-  const MAX_PAGINATION_PAGES = 100;
+  const MAX_PAGINATION_PAGES = 2000;
   async function runPagination(options) {
     const seen = new Set();          // job keys captured this run (cross-page dedup)
     let page = 0;                    // how many pages we've visited (1-based once inside)
@@ -749,193 +778,264 @@
 
   
 // ===================== eurotoptech.com adapter =====================
-// eurotoptech renders MUI job cards; clicking a card opens a [role="dialog"]
-// modal whose "Apply Now" anchor href is already the final destination URL.
-// We iterate cards on each page, open each modal, read fields + apply URL,
-// close it, then advance via the MUI pagination "Go to next page" button.
+// Layout as of Oct 2026: each job is an <article> card (title in <h3>, company,
+// "location · seniority · posted" line, comp line) with NO links on it. Clicking
+// the card opens a [role="dialog"] whose fields are a <dt>/<dd> list (Location,
+// Workplace, Seniority, Posted, Total comp, Yearly savings) and whose "Apply"
+// anchor href is already the employer/ATS destination. Pagination is a row of
+// plain buttons: "Previous", "page 1" (aria-current), "Go to page N", "Next".
+// The page also keeps a second, HIDDEN list (the other tab) in the DOM — with
+// its own articles and its own pager — so everything here is visible-only.
 const ETT_OPEN_DIALOG_TIMEOUT_MS = 6000;
 const ETT_CLOSE_DIALOG_TIMEOUT_MS = 4000;
 const ETT_PAGE_CHANGE_TIMEOUT_MS = 10000;
-const ETT_BETWEEN_CARDS_MS = 120;
+const ETT_BETWEEN_CARDS_MS = 40;
+const ETT_APPLY_RE = /^\s*apply(\s+now)?\b/i;
+const ETT_CARD_SEL = "article";
 
 function ettIsTarget() {
   return /(^|\.)eurotoptech\.com$/i.test(location.hostname);
 }
+// A plain single click. clickAt() fires a synthetic click AND el.click(), which
+// on a pager button advances two pages and on a card can open then re-toggle.
+function ettClick(el) {
+  if (!el) return;
+  try { el.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
+  try { el.click(); } catch (_) {}
+}
+function ettIsCard(el) {
+  return !!(el && el.matches && el.matches(ETT_CARD_SEL) && el.querySelector("h1,h2,h3,h4"));
+}
+function ettCardTitle(card) {
+  return card ? visibleText(card.querySelector("h3, h2, h4, h1") || card) : "";
+}
+// The visible "Showing N jobs" header of the list currently on screen.
+function ettListHeader() {
+  return Array.from(document.querySelectorAll("p, span, div, h2, h3, h4, h5, h6"))
+    .find((e) => e.children.length === 0 && /^(Showing|Previewing)\s[\d,]+(\sof\s[\d,]+)?\sjobs/i.test(visibleText(e)) && isVisible(e)) || null;
+}
 function ettGetCards(columnSpec) {
-  // If the user picked a "Jobs Column" element, scope scraping to that element's
-  // grid/container so only the list they pointed at is scraped.
+  // A picked "Jobs Column": scrape the list that element belongs to.
   if (columnSpec) {
     const picked = findByElementSpec(columnSpec);
     if (picked) {
-      // Always resolve to the GRID the picked element belongs to, so locking a
-      // single card still scrapes that whole list/group (never just one card).
-      const card = picked.closest(".MuiCard-root");
-      const grid = (card && card.closest(".MuiGrid-container"))
-                 || picked.closest(".MuiGrid-container")
-                 || (picked.querySelector && picked.querySelector(".MuiCard-root") ? picked : null);
-      if (grid) {
-        const within = Array.from(grid.querySelectorAll(".MuiCard-root")).filter(isVisible);
+      const card = picked.closest(ETT_CARD_SEL);
+      // The card's list = nearest ancestor holding more than one card.
+      let scope = card ? card.parentElement : picked;
+      while (scope && scope !== document.body && scope.querySelectorAll(ETT_CARD_SEL).length < 2) scope = scope.parentElement;
+      if (scope) {
+        const within = Array.from(scope.querySelectorAll(ETT_CARD_SEL)).filter((c) => ettIsCard(c) && isVisible(c));
         if (within.length) return within;
       }
     }
-    // Picked element isn't tied to a card grid -> fall through to all visible cards.
   }
-  // Default: scope to the grid that follows the "Showing N jobs sorted by ..."
-  // header — i.e. the main Posted-Date list the user is looking at — NOT every
-  // grid (there is a separate secondary/"Remote Tech Jobs" grid on the page).
-  const mainGrid = ettMainJobsGrid();
-  if (mainGrid) {
-    const within = Array.from(mainGrid.querySelectorAll(".MuiCard-root")).filter(isVisible);
-    if (within.length) return within;
+  // Default: every visible card that follows the visible "Showing N jobs" header.
+  const all = Array.from(document.querySelectorAll(ETT_CARD_SEL)).filter((c) => ettIsCard(c) && isVisible(c));
+  const header = ettListHeader();
+  if (header) {
+    const after = all.filter((c) => header.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING);
+    if (after.length) return after;
   }
-  // Last resort: all visible cards across all grids.
-  const all = [];
-  document.querySelectorAll(".MuiGrid-container").forEach(
-    (g) => g.querySelectorAll(".MuiCard-root").forEach((c) => all.push(c))
-  );
-  const cards = all.length ? all : Array.from(document.querySelectorAll(".MuiCard-root"));
-  return Array.from(new Set(cards)).filter(isVisible);
+  return all;
 }
-// The main jobs grid = the first .MuiGrid-container that appears AFTER the
-// "Showing N jobs sorted by ..." header in document order. This isolates the
-// Posted-Date list and excludes the separate Remote/secondary grid.
-function ettMainJobsGrid() {
-  const leaves = Array.from(document.querySelectorAll("p, span, div")).filter((e) => e.children.length === 0);
-  const header = leaves.find((e) => /Showing\s[\d,]+\sjobs\ssorted/i.test(visibleText(e)));
-  if (!header) return null;
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
-  let passed = false, cur;
-  while ((cur = walker.nextNode())) {
-    if (cur === header) passed = true;
-    else if (passed && cur.classList && cur.classList.contains("MuiGrid-container")) return cur;
-  }
-  return null;
+function ettApplyLink(dlg) {
+  return Array.from(dlg.querySelectorAll("a[href]"))
+    .find((a) => ETT_APPLY_RE.test(visibleText(a)) && /^https?:/i.test(a.href || "")) || null;
+}
+function ettAnyDialog() {
+  return Array.from(document.querySelectorAll('[role="dialog"]')).find(isVisible) || null;
 }
 function ettGetDialog() {
-  const dlg = document.querySelector('[role="dialog"]');
-  if (!dlg) return null;
-  const apply = Array.from(dlg.querySelectorAll("a")).find((a) => /apply now/i.test(visibleText(a)));
-  return apply ? dlg : null;
-}
-async function ettWaitDialog() {
-  const start = Date.now();
-  while (Date.now() - start < ETT_OPEN_DIALOG_TIMEOUT_MS) {
-    if (aborted) return null;
-    const dlg = ettGetDialog();
-    if (dlg) return dlg;
-    await sleep(50);
-  }
-  return null;
+  const dlg = ettAnyDialog();
+  return dlg && ettApplyLink(dlg) ? dlg : null;
 }
 function ettCloseDialog() {
-  const dlg = document.querySelector('[role="dialog"]');
+  const dlg = ettAnyDialog();
   if (!dlg) return;
   const btn = dlg.querySelector('button[aria-label="Close job details"]') ||
+              dlg.querySelector('button[aria-label^="Close" i]') ||
               Array.from(dlg.querySelectorAll("button")).find((b) => /^close$/i.test(visibleText(b)));
-  if (btn) clickAt(btn);
+  if (btn) { try { btn.click(); } catch (_) {} }
+  else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
 }
 async function ettWaitNoDialog() {
   const start = Date.now();
   while (Date.now() - start < ETT_CLOSE_DIALOG_TIMEOUT_MS) {
-    if (!document.querySelector('[role="dialog"]')) return true;
+    if (!ettAnyDialog()) return true;
     await sleep(50);
   }
   return false;
 }
-function ettFieldByLabel(dlg, label) {
+// Field values: <dt>Label</dt><dd>Value</dd>. Falls back to the old
+// "label leaf followed by value leaf" scan in case the markup reverts.
+function ettFieldByLabel(dlg, ...labels) {
+  const want = labels.map((l) => l.toLowerCase());
+  for (const dt of dlg.querySelectorAll("dt")) {
+    if (!want.includes(visibleText(dt).toLowerCase())) continue;
+    let dd = dt.nextElementSibling;
+    while (dd && dd.tagName !== "DD" && dd.tagName !== "DT") dd = dd.nextElementSibling;
+    if (dd && dd.tagName === "DD") return visibleText(dd);
+  }
   const leaves = Array.from(dlg.querySelectorAll("*")).filter((e) => e.children.length === 0);
   for (let i = 0; i < leaves.length; i++) {
-    if (visibleText(leaves[i]).toLowerCase() === label.toLowerCase()) {
-      for (let j = i + 1; j < Math.min(i + 6, leaves.length); j++) {
-        const v = visibleText(leaves[j]);
-        if (v && v.toLowerCase() !== label.toLowerCase()) return v;
-      }
-    }
+    if (!want.includes(visibleText(leaves[i]).toLowerCase())) continue;
+    const box = leaves[i].parentElement;
+    const rest = box ? visibleText(box).slice(visibleText(leaves[i]).length).trim() : "";
+    if (rest) return rest;
   }
   return "";
 }
-function ettCompany(dlg) {
-  const chip = dlg.querySelector(".MuiChip-label");
-  return chip ? visibleText(chip) : "";
-}
 function ettTitle(dlg) {
-  const h5 = dlg.querySelector("h1.MuiTypography-h5, h2.MuiTypography-h5, h3.MuiTypography-h5, .MuiTypography-h5");
-  if (h5) return visibleText(h5);
-  const h = dlg.querySelector("h1, h2, h3, h4");
+  const h = dlg.querySelector("h2, h1, h3, .MuiTypography-h5");
   return h ? visibleText(h) : "";
 }
+function ettCompany(dlg) {
+  const chip = dlg.querySelector(".MuiChip-label");
+  if (chip) return visibleText(chip);
+  // The company sits right under the title.
+  const h = dlg.querySelector("h2, h1, h3");
+  const sib = h && h.nextElementSibling;
+  const t = sib ? visibleText(sib) : "";
+  return t && t.length < 80 ? t : "";
+}
 function ettDescription(dlg) {
-  const leaves = Array.from(dlg.querySelectorAll("p, span, div")).filter((e) => e.children.length <= 1);
+  const head = Array.from(dlg.querySelectorAll("h2, h3, h4, h5, h6")).find((h) => /job description/i.test(visibleText(h)));
+  if (head) {
+    let n = head.nextElementSibling, out = "";
+    while (n && !/^H[1-6]$/.test(n.tagName)) { out += " " + visibleText(n); n = n.nextElementSibling; }
+    if (!out.trim() && head.parentElement) out = visibleText(head.parentElement).replace(/^\s*Job description\s*/i, "");
+    if (out.trim()) return out.trim();
+  }
   let best = "";
-  for (const el of leaves) {
+  for (const el of dlg.querySelectorAll("p, div")) {
     const t = visibleText(el);
-    if (t.length > best.length && !/Job Description|Apply Now|Report expired|Track/i.test(t)) best = t;
+    if (t.length > best.length && el.children.length <= 1 && !/Apply|Track/i.test(t.slice(0, 20))) best = t;
   }
   return best;
 }
+const ETT_TRACKING_RE = /^(utm_.*|ref|refid|src|source|referrer|trk|trackingid|gh_src)$/i;
+function ettCleanUrl(u) {
+  try {
+    const url = new URL(u);
+    for (const k of Array.from(url.searchParams.keys())) if (ETT_TRACKING_RE.test(k)) url.searchParams.delete(k);
+    return url.toString();
+  } catch (_) { return u; }
+}
+function ettProvider(u) {
+  let h = "";
+  try { h = new URL(u).hostname.toLowerCase(); } catch (_) { return ""; }
+  const map = [
+    [/greenhouse\.io$|grnh\.se$/, "greenhouse"], [/lever\.co$/, "lever"], [/ashbyhq\.com$/, "ashby"],
+    [/rippling(-ats)?\.com$/, "rippling"], [/myworkday(jobs|site)\.com$/, "workday"], [/smartrecruiters\.com$/, "smartrecruiters"],
+    [/workable\.com$/, "workable"], [/personio\.(com|de)$/, "personio"], [/teamtailor\.com$/, "teamtailor"],
+    [/recruitee\.com$/, "recruitee"], [/icims\.com$/, "icims"], [/successfactors\.(com|eu)$/, "successfactors"],
+    [/oraclecloud\.com$|taleo\.net$/, "oracle"], [/eightfold\.ai$/, "eightfold"], [/linkedin\.com$/, "linkedin"]
+  ];
+  for (const [re, name] of map) if (re.test(h)) return name;
+  return h.replace(/^www\./, "");
+}
 function ettBuildRow(dlg) {
-  const apply = Array.from(dlg.querySelectorAll("a")).find((a) => /apply now/i.test(visibleText(a)));
-  const applyUrl = apply ? apply.href : "";
+  const apply = ettApplyLink(dlg);
+  const applyUrl = apply ? ettCleanUrl(apply.href) : "";
   return {
     url: applyUrl,
+    ats_provider: applyUrl ? ettProvider(applyUrl) : "",
     title: ettTitle(dlg),
     company: ettCompany(dlg),
     location: ettFieldByLabel(dlg, "Location"),
-    salary: ettFieldByLabel(dlg, "Total Compensation"),
-    work_mode: ettFieldByLabel(dlg, "Workplace Type"),
+    salary: ettFieldByLabel(dlg, "Total comp", "Total Compensation"),
+    work_mode: ettFieldByLabel(dlg, "Workplace", "Workplace Type"),
     commitment: "",
     yoe: ettFieldByLabel(dlg, "Seniority"),
-    posted_age: ettFieldByLabel(dlg, "Posted Date"),
+    posted_age: ettFieldByLabel(dlg, "Posted", "Posted Date"),
     description: ettDescription(dlg),
-    skills: ettFieldByLabel(dlg, "Yearly Savings"),
-    job_posting_initial_url: applyUrl,
+    skills: ettFieldByLabel(dlg, "Yearly savings", "Yearly Savings"),
+    job_posting_initial_url: apply ? apply.href : "",
     hiringcafe_viewall_url: location.href,
     status: applyUrl ? "ok" : "no apply url found",
-    method: "apply-now-href",
+    method: "apply-href",
     scraped_at: new Date().toISOString()
   };
 }
-function ettGetPagination() {
+// The Apply href is now eurotoptech's own redirect (/api/jobs/apply/<id>), not
+// the ATS link. Hand it to the background worker, which follows the redirect to
+// the employer site. The scrape keeps clicking cards while lookups run (a few at
+// a time); rows are saved once resolved, and every lookup is awaited before the
+// scrape reports done. Unresolved rows get a blank Job URL, never an eurotoptech one.
+const ETT_MAX_PENDING_RESOLVES = 12;
+const ettPendingResolves = new Set();
+async function ettResolveAndSave(row) {
+  const initial = row.url;
+  if (initial && !isResolvedExternalUrl(initial)) {
+    const r = await send("RESOLVE_URL", { url: initial });
+    if (r && r.ok && r.finalUrl && isResolvedExternalUrl(r.finalUrl)) {
+      row.url = ettCleanUrl(r.finalUrl);
+      row.ats_provider = ettProvider(row.url);
+      row.status = "ok";
+      row.method = "apply-redirect:" + (r.method || "resolved");
+    } else {
+      row.url = "";
+      row.ats_provider = "";
+      row.status = "unresolved: " + ((r && r.error) || "redirect lookup failed");
+      row.method = "apply-redirect:failed";
+    }
+  }
+  await send("JOB_SCRAPED", { row });
+}
+async function ettQueueRow(row) {
+  while (ettPendingResolves.size >= ETT_MAX_PENDING_RESOLVES) await Promise.race(ettPendingResolves);
+  const p = ettResolveAndSave(row).catch(() => {}).finally(() => ettPendingResolves.delete(p));
+  ettPendingResolves.add(p);
+}
+async function ettDrainResolves() {
+  while (ettPendingResolves.size) await Promise.allSettled(Array.from(ettPendingResolves));
+}
+// Card-only fallback row (dialog failed to open): read what the card shows.
+function ettRowFromCard(card, status) {
+  const lines = Array.from(card.querySelectorAll(":scope > div")).map(visibleText).filter(Boolean);
+  const meta = (lines[1] || "").split(/\s*·\s*/);
   return {
-    next: document.querySelector('button[aria-label="Go to next page"]'),
-    current: (() => {
-      const c = document.querySelector('button[aria-current="true"], button[aria-current="page"]');
-      const n = c ? parseInt(visibleText(c), 10) : null;
-      return Number.isFinite(n) ? n : null;
-    })(),
-    total: (() => {
-      let max = null;
-      for (const b of document.querySelectorAll('button[aria-label^="Go to page"], button[aria-label^="page"]')) {
-        const m = (b.getAttribute("aria-label") || "").match(/(\d+)/);
-        if (m) { const n = parseInt(m[1], 10); if (max == null || n > max) max = n; }
-      }
-      return max;
-    })()
+    url: "", ats_provider: "", title: ettCardTitle(card), company: lines[0] || "",
+    location: meta[0] || "", salary: (lines[2] || "").split(/\s*·\s*/)[0] || "", work_mode: "", commitment: "",
+    yoe: meta.length > 2 ? meta[meta.length - 2] : "", posted_age: meta.length > 1 ? meta[meta.length - 1] : "",
+    description: "", skills: "", job_posting_initial_url: "", hiringcafe_viewall_url: location.href,
+    status, method: "card-only", scraped_at: new Date().toISOString()
   };
+}
+function ettGetPagination() {
+  const btns = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(isVisible);
+  const label = (b) => (b.getAttribute("aria-label") || "").trim();
+  const next = btns.find((b) => /^next( page)?$/i.test(visibleText(b)) || /next page/i.test(label(b))) || null;
+  const curEl = btns.find((b) => /^(true|page)$/i.test(b.getAttribute("aria-current") || ""));
+  const curN = curEl ? parseInt(visibleText(curEl), 10) : NaN;
+  let total = null;
+  for (const b of btns) {
+    const m = label(b).match(/^(?:go to )?page\s+(\d+)$/i);
+    if (m) { const n = parseInt(m[1], 10); if (total == null || n > total) total = n; }
+  }
+  return { next, current: Number.isFinite(curN) ? curN : null, total };
+}
+function ettIsDisabled(el) {
+  return !el || el.disabled || el.getAttribute("aria-disabled") === "true" || /\bMui-disabled\b/.test(el.className || "");
 }
 async function ettWaitForCardChange(prevFirstTitle, columnSpec) {
   const start = Date.now();
   while (Date.now() - start < ETT_PAGE_CHANGE_TIMEOUT_MS) {
     if (aborted) return false;
-    await sleep(150);
-    const cards = ettGetCards(columnSpec);
-    const first = cards[0];
-    const t = first ? visibleText(first.querySelector("h1,h2,h3,h4") || first) : "";
-    if (t && t !== prevFirstTitle) return true;
+    await sleep(80);
+    const t = ettCardTitle(ettGetCards(columnSpec)[0]);
+    if (t && t !== prevFirstTitle) { await sleep(150); return true; }
   }
   return false;
 }
-// EuroTopTech moved job details and apply links behind a membership. Signed
-// out, opening a card shows a membership prompt, not the job: no "Apply Now"
-// link and no "Close job details" button. Recognise that and stop, rather than
-// exporting a blank row per card while fighting a dialog we cannot close.
+// Details and apply links may sit behind a membership. Signed out, opening a
+// card can show a membership prompt instead of the job. Recognise that and stop
+// rather than exporting a blank row per card. The job dialog itself mentions
+// paid features ("A Gold feature"), so a dialog WITH an Apply link never counts.
 let ettPaywalled = false;
 function ettIsPaywall(dlg) {
-  if (!dlg) return false;
-  const hasApply = Array.from(dlg.querySelectorAll("a"))
-    .some((a) => /apply now/i.test(visibleText(a)) && /^https?:/i.test(a.href || ""));
-  if (hasApply) return false;
-  return /member|membership|subscri|upgrade|premium|unlock|sign ?up|log ?in|join|pricing|trial/i.test(visibleText(dlg));
+  if (!dlg || ettApplyLink(dlg)) return false;
+  return /member|membership|subscri|upgrade|premium|unlock|sign ?up|log ?in|pricing|trial|gold/i.test(visibleText(dlg));
 }
 function ettDismissPaywall(dlg) {
   const btn = Array.from(dlg.querySelectorAll('button, [role="button"], a')).find((b) =>
@@ -943,14 +1043,15 @@ function ettDismissPaywall(dlg) {
   if (btn) { try { btn.click(); } catch (_) {} }
   else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
 }
-async function ettWaitDialogOrPaywall() {
+async function ettWaitDialogOrPaywall(expectTitle) {
   const start = Date.now();
   while (Date.now() - start < ETT_OPEN_DIALOG_TIMEOUT_MS) {
     if (aborted) return {};
     const dlg = ettGetDialog();
-    if (dlg) return { dlg };
-    const any = document.querySelector('[role="dialog"]');
-    if (any && ettIsPaywall(any)) return { paywall: any };
+    // Only accept the dialog for THIS card (never a stale one still closing).
+    if (dlg && (!expectTitle || ettTitle(dlg) === expectTitle || Date.now() - start > 2500)) return { dlg };
+    const any = ettAnyDialog();
+    if (any && Date.now() - start > 800 && ettIsPaywall(any)) return { paywall: any };
     await sleep(50);
   }
   return {};
@@ -962,27 +1063,20 @@ async function ettScrapePage(pageIndex, totalPages, columnSpec) {
   for (let i = 0; i < cards.length; i++) {
     if (aborted) return;
     const card = cards[i];
-    try { card.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
-    const clickTarget = card.querySelector(".MuiCardActionArea-root") || card;
-    clickAt(clickTarget);
-    // Wait for EITHER the job-details dialog or a membership prompt: the
-    // details wait only recognises a dialog with an "Apply Now" link, which a
-    // membership prompt never has.
-    const opened = await ettWaitDialogOrPaywall();
+    if (!document.body.contains(card)) continue;
+    if (ettAnyDialog()) { ettCloseDialog(); await ettWaitNoDialog(); }
+    const title = ettCardTitle(card);
+    // Click the title, not the card centre: the card also holds a
+    // "Not for me" hide button that must never be pressed.
+    ettClick(card.querySelector("h3, h2, h4") || card);
+    const opened = await ettWaitDialogOrPaywall(title);
     if (opened.paywall) { ettDismissPaywall(opened.paywall); ettPaywalled = true; return; }
-    const dlg = opened.dlg;
-    if (dlg) {
-      const row = ettBuildRow(dlg);
-      await send("JOB_SCRAPED", { row });
+    if (opened.dlg) {
+      await ettQueueRow(ettBuildRow(opened.dlg));
       ettCloseDialog();
       await ettWaitNoDialog();
     } else {
-      await send("JOB_SCRAPED", { row: {
-        url: "", title: visibleText(card.querySelector("h1,h2,h3,h4") || card), company: "",
-        location: "", salary: "", work_mode: "", commitment: "", yoe: "", posted_age: "",
-        description: "", skills: "", job_posting_initial_url: "", hiringcafe_viewall_url: location.href,
-        status: "error: dialog did not open", method: "apply-now-href", scraped_at: new Date().toISOString()
-      }});
+      await send("JOB_SCRAPED", { row: ettRowFromCard(card, "error: dialog did not open") });
     }
     completed += 1;
     if (completed % 4 === 0 || completed === cards.length) {
@@ -996,43 +1090,43 @@ async function ettRun(options) {
   const columnSpec = options.columnSpec || null;
   aborted = false;
   ettPaywalled = false;
-  // The homepage is now a marketing page; the job list lives at /jobs.
-  const hasJobsHeader = Array.from(document.querySelectorAll("p, span, div, h1, h2, h3, h4, h5, h6"))
-    .some((e) => /(Showing|Previewing)\s[\d,]+(\sof\s[\d,]+)?\sjobs/i.test(e.textContent || ""));
-  if ((location.pathname === "/" || location.pathname === "") && !hasJobsHeader) {
+  // The homepage is a marketing page; the job list lives at /jobs.
+  if ((location.pathname === "/" || location.pathname === "") && !ettListHeader()) {
     await send("SCRAPE_DONE", { error: "This is EuroTopTech's homepage, which no longer lists jobs. Open eurotoptech.com/jobs and run again." });
     return;
   }
   if (!ettGetCards(columnSpec).length) {
-    // wait briefly for cards to render
     const start = Date.now();
     while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !ettGetCards(columnSpec).length) await sleep(150);
   }
-  if (!ettGetCards(columnSpec).length) { await send("SCRAPE_DONE", { error: "No job cards found on eurotoptech page." }); return; }
+  if (!ettGetCards(columnSpec).length) { await send("SCRAPE_DONE", { error: "No job cards found on the eurotoptech page." }); return; }
   let guard = 0;
+  const seenPages = new Set();
   while (!aborted) {
     guard += 1;
     const pag = ettGetPagination();
     const pageIndex = pag.current ?? guard;
+    if (seenPages.has(pageIndex)) break;           // pager looped back: done
+    seenPages.add(pageIndex);
     const totalPages = pag.total;
-    const cards = ettGetCards(columnSpec);
-    const prevFirstTitle = cards[0] ? visibleText(cards[0].querySelector("h1,h2,h3,h4") || cards[0]) : "";
+    const prevFirstTitle = ettCardTitle(ettGetCards(columnSpec)[0]);
     await ettScrapePage(pageIndex, totalPages, columnSpec);
     if (ettPaywalled) {
-      await send("SCRAPE_DONE", { error: "EuroTopTech now shows job details and apply links to members only: opening a job showed a membership prompt. Log in with a member account, open eurotoptech.com/jobs, and run again." });
+      await ettDrainResolves();
+      await send("SCRAPE_DONE", { error: "EuroTopTech showed a membership prompt instead of the job details. Log in with a member account, open eurotoptech.com/jobs, and run again." });
       return;
     }
     if (aborted) break;
-    // Honor a picked pagination button (e.g. you pointed at "Next"/"›") before
-    // falling back to the auto-detected "Go to next page" control.
+    // A picked pagination button wins; otherwise the visible "Next" button.
     let next = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
-    if (!next) next = ettGetPagination().next;
-    if (!next || next.disabled || next.getAttribute("aria-disabled") === "true") break;
-    clickAt(next);
+    if (!next || ettIsDisabled(next)) next = ettGetPagination().next;
+    if (ettIsDisabled(next)) break;
+    ettClick(next);
     await sleep(POST_CLICK_GRACE_MS);
     const changed = await ettWaitForCardChange(prevFirstTitle, columnSpec);
     if (!changed) break;
   }
+  await ettDrainResolves();
   await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
 }
 // =================== end eurotoptech.com adapter ===================
@@ -1045,7 +1139,7 @@ async function ettRun(options) {
 // is reachable via https://simplify.jobs/jobs/click/{id}, which background.js
 // follows in a tab and strips of Simplify tracking. The list is infinite-scroll
 // inside an inner overflow container (NOT window).
-const SJ_SCROLL_PAUSE_MS = 900;
+const SJ_SCROLL_PAUSE_MS = 500;
 const SJ_NO_GROWTH_TRIES = 5;
 
 function sjIsTarget() {
@@ -1183,7 +1277,7 @@ async function sjRun() {
     first = await sjRequestRows();
     if (first.length) break;
     sjDismissUpsell();
-    await sleep(400);
+    await sleep(250);
   }
   if (!first.length) {
     const p = sjLastProbe || {};
@@ -1207,7 +1301,8 @@ async function sjRun() {
     }
     await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: 0, status: "running" });
     let completed = 0;
-    await Promise.all(newRows.map(async (row) => {
+    // Lookups run while the list keeps scrolling; SCRAPE_DONE waits for them.
+    track(Promise.all(newRows.map(async (row) => {
       if (aborted) return;
       // Already have the employer URL straight off the job object — nothing to resolve.
       if (!row.url && row.job_posting_initial_url) {
@@ -1227,7 +1322,7 @@ async function sjRun() {
       completed += 1;
       if (completed % 4 === 0 || completed === newRows.length)
         await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: completed, status: "running" });
-    }));
+    })));
     if (aborted) break;
 
     // Stop on "no NEW job ids", not "no new elements": a list that recycles its
@@ -1410,7 +1505,8 @@ async function chProcess(cards, pageIndex, counter) {
   // Everything without a direct link goes to ch-main by job id, while mounted.
   const need = cards.filter((c) => !rows.get(c).url && chIdOf(c));
   const answers = await chRequestUrls(need.map(chIdOf));
-  await Promise.all(cards.map(async (card) => {
+  // Answers are in; redirect-following and saving continue while we scroll on.
+  track(Promise.all(cards.map(async (card) => {
     if (aborted) return;
     const row = rows.get(card);
     const a = answers[chIdOf(card)];
@@ -1429,7 +1525,7 @@ async function chProcess(cards, pageIndex, counter) {
     await send("JOB_SCRAPED", { row });
     counter.n += 1;
     if (counter.n % 4 === 0) await send("PAGE_PROGRESS", { pageIndex, totalPages: null, scrapedThisPage: counter.n, status: "running" });
-  }));
+  })));
 }
 async function chRun(options) {
   options = options || {};
@@ -1447,7 +1543,7 @@ async function chRun(options) {
   let pageIndex = 1, noNew = 0;
   let scroller = chScroller();
   // The grid draws progressively; start from the top so nothing above is skipped.
-  scroller.scrollTop = 0; await sleep(300);
+  scroller.scrollTop = 0; await sleep(200);
   while (!aborted) {
     const fresh = chGetCards().filter((c) => { const k = keyOf(c); return k && !seen.has(k); });
     if (fresh.length) {
@@ -1463,7 +1559,7 @@ async function chRun(options) {
     scroller.scrollTop = before + Math.max(300, Math.floor((scroller.clientHeight || window.innerHeight) * 0.8));
     try { scroller.dispatchEvent(new Event("scroll", { bubbles: true })); } catch (_) {}
     if (scroller === document.scrollingElement) window.dispatchEvent(new Event("scroll"));
-    await sleep(500);
+    await sleep(300);
     // Still moving through drawn cards: not a sign the list is exhausted. Only
     // count a "no new jobs" round once the scroller can go no further.
     const moved = Math.abs(scroller.scrollTop - before) > 2;
@@ -1507,11 +1603,11 @@ async function chRun(options) {
 //      else by fetching the job's /jobs/info/{id} page and reading __NEXT_DATA__.
 // A picked "Jobs Column" scopes to that list's scroller; a picked pagination /
 // "Load more" button is clicked whenever the bottom is reached.
-const JR_SCROLL_PAUSE_MS = 450;
+const JR_SCROLL_PAUSE_MS = 300;
 const JR_BOTTOM_WAIT_MS = 3000;
 const JR_NO_GROWTH_TRIES = 5;
 const JR_IDLE_STOP_MS = 15000;
-const JR_INFO_CONCURRENCY = 3;
+const JR_INFO_CONCURRENCY = 6;
 const JR_END_RE = /adjusting the following criteria|no more jobs|you(?:\u2019|')?ve (?:reached|seen) (?:the end|all)|end of (?:the )?list/i;
 const JR_CARD_SEL = ".job-card-flag-classname, div[class*='index_job-card__']";
 
@@ -1669,7 +1765,7 @@ async function jrRun(options) {
   const scope = scroller === document.scrollingElement || scroller === document.documentElement ? document : scroller;
   // Virtualised list: jobs above the viewport are unmounted, so start at the top.
   jrNudge(scroller, 0);
-  await sleep(700);
+  await sleep(400);
 
   const seen = new Set();
   const queue = [];
@@ -1733,7 +1829,7 @@ async function jrRun(options) {
     const t0 = Date.now();
     let grew = false;
     while (Date.now() - t0 < JR_BOTTOM_WAIT_MS && !aborted) {
-      await sleep(250);
+      await sleep(120);
       if (jrAllCards(scope).some((c) => !seen.has(jrCardId(c)))) { grew = true; break; }
     }
     if (grew) continue;
@@ -1764,8 +1860,9 @@ async function jrRun(options) {
 // Speed: card fields are read straight off the list (all 25 are rendered), and
 // apply URLs are fetched LI_CONCURRENCY at a time while the next page loads.
 // A 429 from LinkedIn pauses every worker and lowers the concurrency.
-const LI_CONCURRENCY = 4;
-const LI_JITTER_MS = 150;          // per-request jitter, per worker
+const LI_CONCURRENCY = 6;
+const LI_JITTER_MS = 80;           // per-request jitter, per worker
+const LI_RECOVER_AFTER = 25;       // successes in a row before speeding back up after a slow-down
 const LI_BACKOFF_MS = 8000;        // pause after a rate-limit response
 function liIsTarget() {
   return /(^|\.)linkedin\.com$/i.test(location.hostname) && /^\/jobs\b/.test(location.pathname);
@@ -1940,21 +2037,21 @@ async function liRun(options) {
   }
   // Shared fetch pool: pages feed it, workers drain it, pagination never waits on it.
   const queue = [];
-  let limit = LI_CONCURRENCY, active = 0, pauseUntil = 0, wake = null, poolClosed = false;
+  let limit = LI_CONCURRENCY, active = 0, pauseUntil = 0, wake = null, poolClosed = false, okStreak = 0;
   const kick = () => { if (wake) { const w = wake; wake = null; w(); } };
   const worker = async () => {
     while (!aborted) {
       const job = queue.shift();
       if (!job) { if (poolClosed) return; await new Promise((r) => { wake = r; setTimeout(r, 200); }); continue; }
       while (Date.now() < pauseUntil && !aborted) await sleep(250);
-      if (active >= limit) { queue.unshift(job); await sleep(100); continue; }
+      if (active >= limit) { queue.unshift(job); await sleep(50); continue; }
       active += 1;
       let a = await liJobApply(job.id);
       if (a.limited) {                                   // back off, slow down, retry once
-        pauseUntil = Date.now() + LI_BACKOFF_MS; limit = Math.max(1, limit - 1);
+        pauseUntil = Date.now() + LI_BACKOFF_MS; limit = Math.max(1, limit - 1); okStreak = 0;
         await sleep(LI_BACKOFF_MS);
         a = await liJobApply(job.id);
-      }
+      } else if (++okStreak >= LI_RECOVER_AFTER && limit < LI_CONCURRENCY) { limit += 1; okStreak = 0; }
       active -= 1;
       await emit(job.id, job.f, a);
       await sleep(Math.round(Math.random() * LI_JITTER_MS));
@@ -1970,7 +2067,7 @@ async function liRun(options) {
       let card = el;
       if (liText(card).length < 15) {
         try { card.scrollIntoView({ block: "center" }); } catch (_) {}
-        await sleep(150);
+        await sleep(100);
         card = (liCards().find((c) => c.id === id) || {}).el || card;
       }
       const f = liCardFields(card);
@@ -1986,7 +2083,7 @@ async function liRun(options) {
     clickAt(next);
     const t0 = Date.now();
     while (Date.now() - t0 < 15000 && !aborted) {
-      await sleep(120);
+      await sleep(80);
       const first = (liCards()[0] || {}).id;
       if (first && first !== before && liCards().some((c) => !seen.has(c.id))) break;
     }
@@ -2013,7 +2110,7 @@ async function liRun(options) {
 // fetched IN_CONCURRENCY at a time while the next results page loads. If Indeed
 // pushes back (human check / 429), every worker pauses, drops to one at a time
 // and retries; the run only stops if the check is still there after that.
-const IN_CONCURRENCY = 5, IN_JITTER_MS = 120, IN_PAGE_PACE_MS = 250, IN_MAX_PAGES = 30;
+const IN_CONCURRENCY = 8, IN_JITTER_MS = 60, IN_PAGE_PACE_MS = 150, IN_MAX_PAGES = 200;
 const IN_BACKOFF_MS = [5000, 15000], IN_MAX_SCROLLS = 60;
 function inIsTarget() { return /(^|\.)indeed\.com$/i.test(location.hostname); }
 function inIsIndeed(u) { try { return /(^|\.)indeed\.com$/i.test(new URL(u).hostname); } catch (_) { return false; } }
@@ -2280,7 +2377,7 @@ async function inRun(options) {
     }
     if (!next || visited.has(next)) break;
     visited.add(next);
-    await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 250));
+    await sleep(IN_PAGE_PACE_MS + Math.round(Math.random() * 150));
     if (aborted || inBlocked) break;
     let html = "";
     try { const r = await fetch(next, { credentials: "include" }); if (r.ok) html = await r.text(); } catch (_) {}
@@ -2422,8 +2519,371 @@ async function hcApiRun() {
 }
 // =================== end hiring.cafe search API ===================
 
+// ===================== notify.careers adapter =====================
+// app.notify.careers/postings: a grid of job cards, 16 more each time "show
+// more" (under the grid) is pressed. Each card's title links straight to the
+// employer's posting (Workday, Lever, Ashby, Greenhouse …); its second line is
+// "Company ⋅ 10/26/2026 ⋅ Canada ⋅ United States". The run reads every card,
+// presses "show more", and repeats until the button is gone. Extra details
+// (salary, workplace type, experience level, fields) come from notify-main.js,
+// which only listens to the search results the page itself loads.
+const NF_CLICK_WAIT_MS = 20000;   // longest wait for a press to add cards
+const NF_END_WAIT_MS = 6000;      // button gone this long (and no new cards) = end of list
+const NF_MAX_STALLS = 3;          // presses in a row that add nothing before giving up
+function nfIsTarget() { return /(^|\.)notify\.careers$/i.test(location.hostname); }
+function nfIsNotify(u) { try { return /(^|\.)notify\.careers$/i.test(new URL(u).hostname); } catch (_) { return true; } }
+function nfShowMore() {
+  return Array.from(document.querySelectorAll('button, [role="button"]')).find(
+    (b) => /^\s*(show|load)\s+more\s*$/i.test(b.textContent || "") && b.offsetParent !== null) || null;
+}
+// The card's title link: the first external link whose text isn't the company.
+function nfTitleLink(card) {
+  return Array.from(card.querySelectorAll("a[href]")).find((a) => /^https?:/i.test(a.href) && !nfIsNotify(a.href)) || null;
+}
+// Cards: direct children of the grid that sits just above "show more".
+function nfGrid() {
+  const btn = nfShowMore();
+  let g = btn && btn.previousElementSibling;
+  if (g && g.querySelector("a[href]")) return g;
+  const a = Array.from(document.querySelectorAll("main a[href]")).find((x) => /^https?:/i.test(x.href) && !nfIsNotify(x.href));
+  let n = a;
+  while (n && n.parentElement && n.parentElement !== document.body) {
+    const p = n.parentElement;
+    if (p.children.length >= 2 && Array.from(p.children).filter((c) => nfTitleLink(c)).length >= 2) return p;
+    n = p;
+  }
+  return null;
+}
+function nfCards() { const g = nfGrid(); return g ? Array.from(g.children).filter((c) => nfTitleLink(c)) : []; }
+function nfAge(ts) {
+  const t = typeof ts === "number" ? (ts < 1e12 ? ts * 1000 : ts) : Date.parse(ts || "");
+  if (!t) return "";
+  const d = Math.max(0, (Date.now() - t) / 86400000);
+  return d < 1 ? Math.max(1, Math.round(d * 24)) + "h" : Math.round(d) + "d";
+}
+function nfSalary(d) {
+  if (!d || (!d.salary_min && !d.salary_max)) return "";
+  const f = (n) => (typeof n === "number" ? n.toLocaleString("en-US") : String(n));
+  const range = [d.salary_min, d.salary_max].filter((x) => x != null && x !== "" && x !== 0).map(f).join(" - ");
+  return range + (d.salary_currency ? " " + d.salary_currency : "") + (d.salary_period ? " / " + d.salary_period : "");
+}
+function nfAsk(urls) {
+  return new Promise((resolve) => {
+    if (!urls.length) { resolve({}); return; }
+    const nonce = "nf" + Date.now() + ":" + Math.random();
+    const onMsg = (e) => {
+      if (e.source !== window || !e.data || e.data.__nfyRes !== nonce) return;
+      window.removeEventListener("message", onMsg);
+      resolve(e.data.jobs || {});
+    };
+    window.addEventListener("message", onMsg);
+    window.postMessage({ __nfyReq: nonce, urls }, "*");
+    setTimeout(() => { window.removeEventListener("message", onMsg); resolve({}); }, 1500);
+  });
+}
+function nfCardRow(card) {
+  const a = nfTitleLink(card);
+  const lines = (card.innerText || "").split("\n").map((s) => s.trim()).filter(Boolean).filter((s) => !/^open menu$/i.test(s));
+  const title = visibleText(a) || lines[0] || "";
+  const meta = (lines.find((l) => l.includes("⋅")) || "").split("⋅").map((s) => s.trim()).filter(Boolean);
+  const date = meta.find((s) => /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(s)) || "";
+  return { url: a ? a.href : "", title, company: meta[0] || "", date,
+           places: meta.filter((s, i) => i > 0 && s !== date) };
+}
+function nfBuildRow(c, d) {
+  const url = c.url && isResolvedExternalUrl(c.url) ? c.url : "";
+  const locs = d && d.locations && d.locations.length ? d.locations : (d && d.countries && d.countries.length ? d.countries : c.places);
+  return {
+    url, title: (d && d.title) || c.title, company: (d && d.company) || c.company,
+    location: (locs || []).join("; "), salary: nfSalary(d),
+    work_mode: (d && d.workplace_type) || "", commitment: "",
+    yoe: d ? (d.experience_levels || []).join(", ") : "",
+    posted_age: c.date || (d ? nfAge(d.posted) : ""),
+    description: "", skills: d ? (d.fields || []).join(", ") : "",
+    job_posting_initial_url: c.url, hiringcafe_viewall_url: location.href,
+    status: url ? "ok" : "no apply link on the card",
+    method: url ? (d ? "notify-page-data" : "notify-card-link") : "",
+    scraped_at: new Date().toISOString()
+  };
+}
+async function nfRun(options) {
+  options = options || {};
+  aborted = false;
+  const start = Date.now();
+  while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !nfCards().length && !aborted) await sleep(200);
+  if (!nfCards().length) {
+    await send("SCRAPE_DONE", { error: "No Notify job cards found. Open app.notify.careers/postings (signed in) with jobs showing, then try again." });
+    return;
+  }
+  const totalM = (document.body.innerText || "").match(/searching from\s+([\d,]+)\s+job/i);
+  const total = totalM ? parseInt(totalM[1].replace(/,/g, ""), 10) : null;
+  const perPress = 16;
+  const totalPages = total ? Math.max(1, Math.ceil(total / perPress)) : null;
+  const seen = new Set();
+  let presses = 0, stalls = 0, count = 0, problem = "";
+  const harvest = async () => {
+    const fresh = [];
+    for (const card of nfCards()) {
+      const c = nfCardRow(card);
+      const key = c.url || (c.title + "|" + c.company);
+      if (!key || seen.has(key)) continue;
+      seen.add(key); fresh.push(c);
+    }
+    if (!fresh.length) return 0;
+    const details = await nfAsk(fresh.map((c) => c.url).filter(Boolean));
+    await Promise.all(fresh.map((c) => send("JOB_SCRAPED", { row: nfBuildRow(c, details[c.url]) })));
+    count += fresh.length;
+    await send("PAGE_PROGRESS", { pageIndex: presses + 1, totalPages, scrapedThisPage: fresh.length, status: "running" });
+    return fresh.length;
+  };
+  await harvest();
+  while (!aborted) {
+    // Find the button (it can be hidden briefly while a batch loads).
+    const before = nfCards().length;
+    let btn = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
+    const t0 = Date.now();
+    while (!btn && !aborted && Date.now() - t0 < NF_END_WAIT_MS) {
+      btn = nfShowMore();
+      if (!btn || btn.disabled) { btn = null; await harvest(); await sleep(150); }
+    }
+    if (aborted) break;
+    if (!btn) { if (nfCards().length !== before) continue; break; }   // no button, nothing new: end of list
+    try { btn.scrollIntoView({ block: "center" }); } catch (_) {}
+    clickAt(btn);
+    presses += 1;
+    const t1 = Date.now();
+    let iv = 60;
+    while (!aborted && nfCards().length <= before && Date.now() - t1 < NF_CLICK_WAIT_MS) { await sleep(iv); if (iv < 300) iv = Math.round(iv * 1.4); }
+    if (aborted) break;
+    if (nfCards().length <= before) {
+      if (++stalls >= NF_MAX_STALLS) { problem = "\"show more\" stopped adding jobs after " + count; break; }
+      continue;
+    }
+    stalls = 0;
+    await harvest();
+  }
+  await harvest();
+  if (aborted) { await send("SCRAPE_DONE", { error: "stopped by user" }); return; }
+  if (problem) { await send("SCRAPE_DONE", { error: problem + " (pressed it " + NF_MAX_STALLS + "× with no change). Export what's saved, or scroll the Notify page and run again." }); return; }
+  await send("SCRAPE_DONE", {});
+}
+// =================== end notify.careers adapter ===================
+
+// ===================== flexjobs.com adapter =====================
+// FlexJobs search pages (www.flexjobs.com/search?…) are Next.js pages: each
+// results page embeds its 50 jobs in <script id="__NEXT_DATA__"> at
+// props.pageProps.jobsData.jobs.results, and every job there carries the
+// employer's own applyUrl (Greenhouse, Lever, Workday, iCIMS, ADP, …) when you
+// are signed in with a FlexJobs membership. Nothing is clicked: page 1 is read
+// from the current URL, later pages are fetched (…&page=N) without leaving the
+// tab. A FlexJobs-hosted apply link, if any, is followed by the background
+// worker; one that stays on FlexJobs is left blank and flagged.
+// Pages are fetched FJ_PAGE_CONCURRENCY at a time (each is one ~250 KB request).
+// FJ_MAX_PAGES: 0 = no limit (every page of the search, starting from the one open).
+const FJ_MAX_PAGES = 0, FJ_PAGE_CONCURRENCY = 6;
+const FJ_RETRIES = 4;                 // per page, with growing waits (1s, 2s, 4s, 8s)
+const FJ_SLOWDOWN_PAUSE_MS = 20000;   // all page loads pause this long if FlexJobs says "slow down"
+const FJ_MAX_FAILED_IN_A_ROW = 8;     // this many pages failing back to back ends the run
+function fjIsTarget() { return /(^|\.)flexjobs\.com$/i.test(location.hostname); }
+function fjIsFlex(u) { try { return /(^|\.)flexjobs\.com$/i.test(new URL(u).hostname); } catch (_) { return false; } }
+function fjNextData(docOrHtml) {
+  let txt = "";
+  if (typeof docOrHtml === "string") {
+    const m = docOrHtml.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i);
+    txt = m ? m[1] : "";
+  } else {
+    const s = docOrHtml.getElementById("__NEXT_DATA__");
+    txt = s ? s.textContent : "";
+  }
+  if (!txt) return null;
+  try {
+    const pp = JSON.parse(txt).props.pageProps || {};
+    const jobs = (pp.jobsData && pp.jobsData.jobs) || null;
+    return { jobs, isLoggedIn: !!pp.isLoggedIn, isPremium: !!pp.isPremiumUser };
+  } catch (_) { return null; }
+}
+function fjAge(iso) {
+  const t = Date.parse(iso || "");
+  if (!t) return "";
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + "m";
+  if (s < 86400) return Math.round(s / 3600) + "h";
+  if (s < 86400 * 7) return Math.round(s / 86400) + "d";
+  return Math.round(s / (86400 * 7)) + "w";
+}
+function fjSalary(r) {
+  if (r.salaryRange) return String(r.salaryRange).replace(/\.00\b/g, "");
+  if (r.salaryMin || r.salaryMax) {
+    const cur = r.salaryCurrency || "", unit = r.salaryUnit ? " " + r.salaryUnit : "";
+    return [r.salaryMin, r.salaryMax].filter(Boolean).join(" - ") + (cur ? " " + cur : "") + unit;
+  }
+  const sr = Array.isArray(r.salaryRanges) && r.salaryRanges[0];
+  if (sr && (sr.salaryMin || sr.salaryMax)) return [sr.salaryMin, sr.salaryMax].filter(Boolean).join(" - ") + (sr.salaryCurrency ? " " + sr.salaryCurrency : "") + (sr.salaryUnit ? " " + sr.salaryUnit : "");
+  return "";
+}
+const fjList = (v) => (Array.isArray(v) ? v : []).map((x) => (x && typeof x === "object") ? (x.name || "") : String(x || "")).filter(Boolean);
+function fjJob(r) {
+  const cats = fjList(r.jobCategories && r.jobCategories.length ? r.jobCategories : r.categories);
+  return {
+    id: r.id || "",
+    title: r.title || "",
+    company: (r.company && r.company.name) || "",
+    location: fjList(r.jobLocations && r.jobLocations.length ? r.jobLocations : r.displayLocations).join("; ") || fjList(r.countries).join("; "),
+    salary: fjSalary(r),
+    work_mode: fjList(r.remoteOptions).join(", "),
+    commitment: fjList(r.jobSchedules).concat(fjList(r.jobTypes)).join(", "),
+    yoe: fjList(r.careerLevel).join(", "),
+    posted_age: fjAge(r.postedDate || r.createdOn),
+    description: String(r.jobSummary || r.description || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim(),
+    skills: cats.join(", "),
+    apply: r.applyUrl || "",
+    view: location.origin + "/HostedJob.aspx?id=" + encodeURIComponent(r.id || "")
+  };
+}
+// A picked Jobs Column: only the job ids shown inside it.
+function fjPickedIds(columnSpec) {
+  if (!columnSpec) return null;
+  const el = findByElementSpec(columnSpec);
+  if (!el) return null;
+  const row = el.closest("[data-index]");
+  const box = (row && row.parentElement) || el;
+  const ids = new Set(Array.from(box.querySelectorAll('a[id^="job-name-"]')).map((a) => a.id.replace(/^job-name-/, "")));
+  return ids.size ? ids : null;
+}
+function fjPageUrl(base, n) {
+  const u = new URL(base);
+  if (n <= 1) u.searchParams.delete("page"); else u.searchParams.set("page", String(n));
+  return u.href;
+}
+// Shared by every page worker: when FlexJobs answers 429/403/503, all page
+// loads wait until this time before trying again.
+let fjPauseUntil = 0;
+// Returns the page data, or { failed: reason } once every retry has been used.
+async function fjFetchPage(url, retries = FJ_RETRIES) {
+  let reason = "";
+  for (let attempt = 0; attempt <= retries && !aborted; attempt++) {
+    while (Date.now() < fjPauseUntil && !aborted) await sleep(250);
+    if (attempt > 0) await sleep(1000 * Math.pow(2, attempt - 1));
+    try {
+      const r = await fetch(url, { credentials: "include" });
+      if (r.status === 429 || r.status === 403 || r.status === 503) {
+        reason = "FlexJobs asked to slow down (HTTP " + r.status + ")";
+        fjPauseUntil = Math.max(fjPauseUntil, Date.now() + FJ_SLOWDOWN_PAUSE_MS);
+        continue;
+      }
+      if (!r.ok) { reason = "HTTP " + r.status; continue; }
+      const d = fjNextData(await r.text());
+      if (d && d.jobs) return d;
+      reason = "page had no job data (signed out?)";
+    } catch (e) { reason = (e && e.message) || "network error"; }
+  }
+  return { failed: reason || "stopped" };
+}
+async function fjRun(options) {
+  options = options || {};
+  aborted = false;
+  if (!/^\/search\b/i.test(location.pathname)) {
+    await send("SCRAPE_DONE", { error: "Open a FlexJobs job search (flexjobs.com/search?…) with results showing, then run again." });
+    return;
+  }
+  // The page's own copy can be stale after in-page filtering, so read this URL fresh.
+  let data = await fjFetchPage(location.href);
+  if (!data || data.failed || !data.jobs) data = fjNextData(document);
+  if (!data || !data.jobs || !Array.isArray(data.jobs.results) || !data.jobs.results.length) {
+    await send("SCRAPE_DONE", { error: "No FlexJobs jobs found on this page. Open a FlexJobs search with results showing, then try again." });
+    return;
+  }
+  const noMember = !data.isLoggedIn ? "log in to FlexJobs to see apply links" : !data.isPremium ? "a FlexJobs membership is needed to see apply links" : "";
+  const picked = fjPickedIds(options.columnSpec);
+  const totalPages = Number(data.jobs.totalPages) || null;
+  const startPage = Number(data.jobs.currentPage) || Number(new URL(location.href).searchParams.get("page")) || 1;
+  const lastPage = Math.min(totalPages || Infinity, FJ_MAX_PAGES > 0 ? startPage + FJ_MAX_PAGES - 1 : Infinity);
+  const seen = new Set();
+  let page = startPage, count = 0, pagesDone = 0;
+  const emit = async (j) => {
+    let url = "", status = "", method = "", initial = j.apply || j.view;
+    if (j.apply && !fjIsFlex(j.apply) && isResolvedExternalUrl(j.apply)) {
+      url = j.apply; status = "ok"; method = "flexjobs-page-data";
+    } else if (j.apply) {
+      const resp = await send("RESOLVE_URL", { url: j.apply });
+      if (resp && resp.ok && resp.finalUrl && !fjIsFlex(resp.finalUrl) && isResolvedExternalUrl(resp.finalUrl)) {
+        url = resp.finalUrl; status = "ok"; method = "flexjobs-redirect+" + (resp.method || "fetch");
+      } else status = "unresolved: apply link stayed on FlexJobs" + (resp && resp.error ? " (" + resp.error + ")" : "");
+    } else status = "no apply url" + (noMember ? ": " + noMember : "");
+    await send("JOB_SCRAPED", { row: {
+      url, title: j.title, company: j.company, location: j.location, salary: j.salary,
+      work_mode: j.work_mode, commitment: j.commitment, yoe: j.yoe, posted_age: j.posted_age,
+      description: j.description, skills: j.skills,
+      job_posting_initial_url: initial, hiringcafe_viewall_url: j.view,
+      status, method, scraped_at: new Date().toISOString() } });
+    count += 1;
+  };
+  // "This page" in the panel = jobs saved from the page just finished.
+  const takePage = async (d, n) => {
+    const fresh = d.jobs.results.map(fjJob).filter((j) => j.id && !seen.has(j.id));
+    for (const j of fresh) seen.add(j.id);
+    const take = (pagesDone === 0 && picked) ? fresh.filter((j) => picked.has(j.id)) : fresh;
+    pagesDone += 1;
+    page = Math.max(page, n);
+    await Promise.all(take.map(emit));
+    await send("PAGE_PROGRESS", { pageIndex: page, totalPages, scrapedThisPage: take.length, status: "running" });
+    return fresh.length;
+  };
+  await takePage(data, startPage);
+  // Later pages by number (FlexJobs' own Next link is just ?page=N+1), several
+  // at once. A page that comes back empty marks the end of the results.
+  // Pages can arrive out of order; rows are still saved in page order.
+  // A page that fails every retry is skipped (and reported), not treated as
+  // the end; only a page that loads with no jobs on it ends the run.
+  let nextN = startPage + 1, endAt = lastPage, flushN = startPage + 1, flushing = Promise.resolve();
+  const ready = new Map(), skipped = [];
+  let failedInARow = 0, gaveUp = "";
+  const flush = () => (flushing = flushing.then(async () => {
+    while (ready.has(flushN)) {
+      const d = ready.get(flushN); ready.delete(flushN);
+      if (d) await takePage(d, flushN);
+      flushN += 1;
+    }
+  }));
+  const pageWorker = async () => {
+    while (!aborted && !gaveUp) {
+      const n = nextN++;
+      if (n > endAt) return;
+      const d = await fjFetchPage(fjPageUrl(location.href, n));
+      if (aborted) return;
+      if (d.failed) {
+        skipped.push(n);
+        if (++failedInARow >= FJ_MAX_FAILED_IN_A_ROW) gaveUp = "page " + n + ": " + d.failed;
+        ready.set(n, null); flush();
+        continue;
+      }
+      failedInARow = 0;
+      if (!Array.isArray(d.jobs.results) || !d.jobs.results.length) { endAt = Math.min(endAt, n - 1); continue; }
+      if (n <= endAt) { ready.set(n, d); flush(); }
+    }
+  };
+  await Promise.all(Array.from({ length: FJ_PAGE_CONCURRENCY }, pageWorker));
+  await flush();
+  if (aborted) { await send("SCRAPE_DONE", { error: "stopped by user" }); return; }
+  skipped.sort((a, b) => a - b);
+  const list = skipped.length > 12 ? skipped.slice(0, 12).join(", ") + ", …" : skipped.join(", ");
+  if (gaveUp) {
+    await send("SCRAPE_DONE", { error: "FlexJobs stopped answering (" + gaveUp + "), so the run ended after page " + page +
+      " with " + count + " jobs saved. Export now, or open page " + (flushN) + " of the search and run again to continue." });
+    return;
+  }
+  if (skipped.length) {
+    await send("SCRAPE_DONE", { error: "Finished with " + count + " jobs, but " + skipped.length + " page(s) could not be loaded and were skipped: " + list + "." });
+    return;
+  }
+  await send("SCRAPE_DONE", {});
+}
+// =================== end flexjobs.com adapter ===================
+
 async function runScrape(options) {
   if (hcIsTarget() && (await hcApiRun())) return;
+  if (nfIsTarget()) { return nfRun(options); }
+  if (fjIsTarget()) { return fjRun(options); }
   if (liIsTarget()) { return liRun(options); }
   if (inIsTarget()) { return inRun(options); }
   if (jrIsTarget()) { return jrRun(options); }

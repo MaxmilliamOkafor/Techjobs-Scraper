@@ -11,7 +11,7 @@
     <div class="logo" aria-hidden="true">TJ</div>
     <div>
       <h1>Tech Jobs Scraper</h1>
-      <p class="sub">hiring.cafe, jobright.ai, careerhound.io, eurotoptech, simplify, hnhiring.com, LinkedIn &amp; Indeed — job &amp; URL scraper</p>
+      <p class="sub">hiring.cafe, jobright.ai, careerhound.io, eurotoptech, simplify, hnhiring.com, LinkedIn, Indeed, FlexJobs &amp; Notify — job &amp; URL scraper</p>
     </div>
   </header>
 
@@ -127,6 +127,21 @@
     </div>
     <pre id="csv-log" class="csv-log" aria-live="polite"></pre>
   </section>
+  <section id="showall-card">
+    <div class="card-title">LazyApply Queue → Show All Jobs</div>
+    <p class="hint">Scrolls the Job Queue to the bottom and keeps pressing <b>Show More</b>
+      until every queued job is showing, then lists each job's URL.</p>
+    <div class="actions csv-actions">
+      <button id="showall-start-btn" class="primary">Show all queue jobs</button>
+      <button id="showall-stop-btn" class="ghost" disabled>Stop</button>
+    </div>
+    <pre id="showall-status" class="csv-summary" aria-live="polite"></pre>
+    <pre id="showall-urls" class="csv-log showall-urls" aria-label="Job URLs"></pre>
+    <div class="actions csv-actions">
+      <button id="showall-copy-btn" class="secondary" disabled>Copy URLs</button>
+      <button id="showall-export-btn" class="secondary" disabled>Export URLs CSV</button>
+    </div>
+  </section>
   <section id="cleanup-card">
     <div class="card-title">LazyApply Queue → Mass Delete</div>
     <div class="strategy-grid">
@@ -171,7 +186,9 @@
       <a href="https://simplify.jobs/" target="_blank" rel="noopener">simplify</a>,
       <a href="https://hnhiring.com/" target="_blank" rel="noopener">hnhiring.com</a>,
       <a href="https://www.linkedin.com/jobs/search/" target="_blank" rel="noopener">LinkedIn</a>,
-      or <a href="https://www.indeed.com/" target="_blank" rel="noopener">Indeed</a>,
+      <a href="https://www.indeed.com/" target="_blank" rel="noopener">Indeed</a>,
+      <a href="https://www.flexjobs.com/search?usecLocation=true&amp;quicksearch=just_posted_jobs" target="_blank" rel="noopener">FlexJobs</a>,
+      or <a href="https://app.notify.careers/postings" target="_blank" rel="noopener">Notify</a>,
       then hit <b>Start scraping</b>.
     </p>
   </footer>
@@ -179,5 +196,6 @@
   <script src="popup.js"></script>
   <script src="csv-lazyapply.js"></script>
   <script src="queue-cleanup.js"></script>
+  <script src="queue-showall.js"></script>
 </body>
 </html>

@@ -15,7 +15,15 @@ Although this started as a hiring.cafe scraper, the extension now recognises sev
 - **jobright.ai** — dedicated adapter for `/jobs/recommend` (and Liked / Applied / External tabs). Jobright's list is a *virtualised* infinite scroll inside an inner scroll panel (only ~10 cards exist in the DOM at once), so the adapter scrolls that panel itself, collects every card by its job id, and exports the **real employer apply URL** (Greenhouse, Workday, iCIMS, ...) — read from the page's own list-API responses, or from each job's detail page as a fallback. Pagination strategy doesn't matter here (it's always infinite scroll); a picked *Jobs Column* scopes to that list, and a picked *Load more* button is clicked at the bottom if present. Reload the jobright tab once after installing/updating the extension so the API listener is in place.
 - **hnhiring.com** — Hacker News "Who is hiring" ATS-link extractor.
 - **LinkedIn** — open a job search (`linkedin.com/jobs/search-results/…` or the classic `linkedin.com/jobs/search/…`). Reads each job in the list (scrolling each into view, since LinkedIn only draws items near the screen), then gets the employer's apply link from the job's own data. **Easy Apply** jobs have no employer link and are flagged instead. Follows LinkedIn's Next-page button; apply links are fetched 4 at a time while the next page loads (about 50 jobs in 5 seconds); if LinkedIn returns a rate-limit response the scraper pauses and slows down automatically.
+- **FlexJobs** — open a FlexJobs search (`flexjobs.com/search?…`, e.g. [Just posted jobs](https://www.flexjobs.com/search?usecLocation=true&quicksearch=just_posted_jobs)). Reads the 50 jobs each results page embeds (title, company, locations, salary, remote level, schedule, career level, categories, summary) and the employer's apply link (Greenhouse, Lever, Workday, iCIMS, ADP, …). Later pages are fetched without leaving the tab, 6 at a time, through to the last page of the search (no page limit), starting from the page you're on. A page that fails is retried with growing waits and, if it still fails, skipped and listed when the run ends; if FlexJobs asks to slow down, all page loads pause for 20 seconds. A full 2,600-page search takes roughly 5–10 minutes. Keep the FlexJobs tab open until the status says Done. Apply links are only shown to signed-in FlexJobs members; without a membership the rows are flagged instead.
+- **Notify** — open `app.notify.careers/postings` (signed in), set your filters, and click **Start scraping**. Each card's title already links to the employer's posting (Workday, Lever, Ashby, Greenhouse …), so no link lookups are needed. The run reads every card, presses **show more** (16 jobs a press), and repeats until the button is gone. Salary, workplace type, experience level and fields are added from the search results the page itself loads (the extension only listens; it sends no requests of its own). Reload the Notify tab once after installing/updating so that listener is in place. About 3,200 jobs take a few minutes.
 - **Indeed** — open a job search on any Indeed country site (`indeed.com/jobs?q=…`, `uk.indeed.com`, `ie.indeed.com`, …). Reads the results list the page embeds; for jobs that apply on the company's site, follows Indeed's apply link to the employer's page. **Easily apply** jobs are flagged. Later result pages are fetched without leaving the tab. If Indeed asks for a human check, the run stops and says so — complete the check and run again.
+
+## LazyApply Job Queue tools
+
+- **Show all queue jobs** — open `app.lazyapply.com/dashboard` on the **Job Queue** tab and press *Show all queue jobs* in the side panel. It scrolls to the bottom and keeps pressing **Show More** (20 jobs per press) until the button no longer appears, then lists every queued job's URL (read from the page's own data — the table doesn't show URLs). *Copy URLs* copies them one per line; *Export URLs CSV* downloads URL, company, title, platform, date added and status. *Stop* ends it early and still lists what's showing.
+- **CSV → LazyApply Queue** — adds Greenhouse / Lever / Ashby / Rippling job URLs from CSV files to the queue.
+- **Mass Delete** — removes all (or matching) jobs from the queue.
 
 ## Features
 
@@ -103,8 +111,8 @@ In `content.js`:
 | Constant | Default | Effect |
 |---|---|---|
 | `PAGE_RENDER_TIMEOUT_MS` | 12000 | Hard cap on waiting for a new page to render |
-| `PAGE_QUIET_MS` | 350 | DOM must be quiet this long before a page is considered ready |
-| `POST_CLICK_GRACE_MS` | 200 | Pause after clicking next/load-more |
+| `PAGE_QUIET_MS` | 250 | DOM must be quiet this long before a page is considered ready |
+| `POST_CLICK_GRACE_MS` | 80 | Pause after clicking next/load-more |
 | `APPEND_NO_GROWTH_TRIES` | 4 | Stop autoscroll/loadmore after this many no-growth waits |
 | `SCROLL_STEP_PX` | 1200 | How far each autoscroll tick scrolls |
 
@@ -115,7 +123,15 @@ In `background.js`:
 | `FETCH_TIMEOUT_MS` | 5000 | Per-URL fetch timeout |
 | `TAB_RESOLVE_TIMEOUT_MS` | 8000 | Per-URL tab fallback timeout |
 | `TAB_POST_LOAD_QUIET_MS` | 200 | Wait after tab `complete` to catch JS redirects |
-| `MAX_CONCURRENT_TABS` | 6 | Concurrent tab fallback resolves |
+| `MAX_CONCURRENT_TABS` | 4 | Concurrent tab fallback resolves |
+| `MAX_CONCURRENT_FETCHES` | 24 | Link lookups running at once, all sites |
+| `MAX_FETCHES_PER_HOST` | 10 | Link lookups running at once against one site |
+
+Per-site speed settings (in `content.js`): `LI_CONCURRENCY` 6 (LinkedIn; drops automatically after a rate-limit response and climbs back after 25 clean requests), `IN_CONCURRENCY` 8 (Indeed), `JR_INFO_CONCURRENCY` 6 (jobright), `ETT_MAX_PENDING_RESOLVES` 12 (eurotoptech), `FJ_PAGE_CONCURRENCY` 4 (FlexJobs pages loaded at once).
+
+**Large runs.** Results are saved in chunks of 2,000 rows (the extension has the `unlimitedStorage` permission), so runs of 100,000+ jobs save and export without slowing down. Export builds the CSV straight from the saved chunks.
+
+**Speed design.** Every adapter keeps moving to the next page / scroll position while the previous page's link lookups are still running; the run only reports *Done* once all of them have finished. Saved rows are cached in memory by the background worker, so saving stays fast however large the run gets.
 
 ## File layout
 
@@ -127,6 +143,9 @@ hiringcafe-scraper/
 ├── popup.html
 ├── popup.css
 ├── popup.js
+├── csv-lazyapply.js
+├── queue-cleanup.js
+├── queue-showall.js
 ├── icons/
 │   ├── icon16.png
 │   ├── icon48.png
