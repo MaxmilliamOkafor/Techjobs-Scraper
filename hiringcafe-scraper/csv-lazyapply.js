@@ -492,6 +492,89 @@
     }
   }
 
+  // ---- Fast add: replay the page's own "add to queue" request -------------
+  // LazyApply takes ~2-3 s per add and its one field is locked meanwhile, so
+  // the page can only ever add one URL at a time. The first add still goes
+  // through the page as before; while it does, a recorder (page world) notes
+  // the request the page itself sends to LazyApply for it. Once that request
+  // has come back OK, the remaining URLs are sent the same way, several at a
+  // time — no extra tabs, same login. Anything that doesn't come back clearly
+  // OK is reported, never silently counted.
+  // Must be self-contained (serialized into the page, MAIN world).
+  function armAddRecorderInPage(url) {
+    const R = window.__tjsLaRec || (window.__tjsLaRec = { pending: "", template: null });
+    R.pending = url;
+    if (R.installed) return { ready: !!R.template };
+    R.installed = true;
+    R.origFetch = window.fetch;
+    const keysOf = (txt) => { try { const o = JSON.parse(txt); return o && typeof o === "object" && !Array.isArray(o) ? Object.keys(o).sort().join(",") : ""; } catch (_) { return ""; } };
+    R.keysOf = keysOf;
+    const ours = (u) => { try { return /(^|\.)lazyapply\.com$/i.test(new URL(u, location.href).hostname); } catch (_) { return false; } };
+    // Only a write to LazyApply itself whose body carries the URL being added.
+    const capture = (kind, reqUrl, method, headers, body) => {
+      if (typeof body !== "string" || !R.pending || /^(GET|HEAD)$/i.test(method || "GET") || !ours(reqUrl)) return null;
+      for (const [mode, v] of [["raw", R.pending], ["json", R.pending.replace(/\//g, "\\/")], ["uri", encodeURIComponent(R.pending)]]) {
+        if (body.includes(v)) return { kind, url: new URL(reqUrl, location.href).href, method, headers, parts: body.split(v), mode };
+      }
+      return null;
+    };
+    window.fetch = async function (input, init) {
+      let cap = null;
+      try {
+        const reqUrl = typeof input === "string" ? input : (input && input.url) || String(input);
+        const method = (init && init.method) || (input && input.method) || "GET";
+        const h = {};
+        new Headers((init && init.headers) || (input && input.headers) || {}).forEach((v, k) => { h[k] = v; });
+        cap = capture("fetch", reqUrl, method, h, init && init.body);
+      } catch (_) {}
+      const resp = await R.origFetch.apply(this, arguments);
+      if (cap && resp.ok) { try { cap.keys = keysOf(await resp.clone().text()); R.template = cap; } catch (_) {} }
+      return resp;
+    };
+    const X = XMLHttpRequest.prototype, open = X.open, setH = X.setRequestHeader, send = X.send;
+    X.open = function (m, u) { this.__tjs = { m, u, h: {} }; return open.apply(this, arguments); };
+    X.setRequestHeader = function (k, v) { if (this.__tjs) this.__tjs.h[k] = v; return setH.apply(this, arguments); };
+    X.send = function (body) {
+      const t = this.__tjs, cap = t && capture("xhr", t.u, t.m, t.h, body);
+      if (cap) this.addEventListener("loadend", () => {
+        if (this.status >= 200 && this.status < 300) { cap.keys = keysOf(this.responseText || ""); R.template = cap; }
+      });
+      return send.apply(this, arguments);
+    };
+    return { ready: false };
+  }
+  // Send the recorded request for each URL, `conc` at a time (page world).
+  async function replayAddsInPage(urls, conc) {
+    const R = window.__tjsLaRec, T = R && R.template;
+    if (!T) return { noTemplate: true };
+    const enc = (u) => T.mode === "json" ? u.replace(/\//g, "\\/") : T.mode === "uri" ? encodeURIComponent(u) : u;
+    const msgOf = (txt) => { try { const o = JSON.parse(txt); return String(o.message || o.error || o.msg || txt).slice(0, 160); } catch (_) { return String(txt || "").slice(0, 160); } };
+    const one = async (u) => {
+      try {
+        const r = await R.origFetch.call(window, T.url, { method: T.method, headers: T.headers, body: T.parts.join(enc(u)), credentials: "include" });
+        const txt = await r.text();
+        if (r.status === 429) return { retry: true };
+        if (r.ok) {
+          // Same shape of answer as the add that is known to have worked.
+          if ((!T.keys || R.keysOf(txt) === T.keys) && !/"(error|err)"\s*:\s*"|"success"\s*:\s*false/i.test(txt)) return { ok: true };
+          return { unsure: true, error: "unexpected answer: " + msgOf(txt) };
+        }
+        if (r.status >= 400 && r.status < 500) return { rejected: true, error: msgOf(txt) || ("HTTP " + r.status) };
+        return { unsure: true, error: "HTTP " + r.status };
+      } catch (e) { return { unsure: true, error: (e && e.message) || String(e) }; }
+    };
+    const out = new Array(urls.length);
+    let next = 0, halt = false;
+    await Promise.all(Array.from({ length: Math.max(1, conc) }, async () => {
+      while (!halt && next < urls.length) {
+        const k = next++;
+        out[k] = await one(urls[k]);
+        if (out[k].retry) halt = true;     // LazyApply says slow down: stop here
+      }
+    }));
+    return { results: out };
+  }
+
   async function findLazyApplyTab() {
     const tabs = await chrome.tabs.query({ url: LAZYAPPLY_MATCH });
     if (!tabs.length) return null;
@@ -543,6 +626,8 @@
     // which is the real synchronisation. The gap bought nothing and cost
     // seconds per URL.
     let injectFails = 0; // consecutive executeScript failures (crashed/reloading tab)
+    let fastReady = false, fastConc = 6, fastOff = false;   // replaying the page's add request
+    const FAST_CHUNK = 24;
     const unconfirmed = [];   // added-but-not-proven, reported at the end
     let added = 0;
     const failed = [];
@@ -565,7 +650,44 @@
         log(`\n■ LazyApply tab not found — paused at ${i}/${masterList.length}. Open https://app.lazyapply.com/dashboard (Job Queue) and click "Add to LazyApply Queue" to resume from #${i + 1}.`);
         break;
       }
+      // FAST PATH: once the page's own add request is known, send the next
+      // URLs that way, fastConc at a time.
+      if (fastReady && !fastOff) {
+        const chunk = masterList.slice(i, i + FAST_CHUNK);
+        let out = null;
+        try {
+          const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: replayAddsInPage, args: [chunk, fastConc] });
+          out = res && res.result;
+        } catch (_) { out = null; }
+        if (!out || out.noTemplate) { fastReady = false; i -= 1; continue; }   // page reloaded: learn it again
+        const lines = [];
+        let done = 0, unsure = 0, slowDown = false;
+        for (let k = 0; k < chunk.length; k++) {
+          const r = out.results[k];
+          if (!r || r.retry) { slowDown = !!(r && r.retry); break; }
+          const n = i + k + 1;
+          if (r.ok) { added++; lines.push(`Adding ${n}/${masterList.length} ✓  ${chunk[k]}`); }
+          else if (r.rejected) { failed.push({ url: chunk[k], error: r.error }); lines.push(`Adding ${n}/${masterList.length} ✗  ${chunk[k]}  — ${r.error}`); }
+          else { unsure++; unconfirmed.push(chunk[k]); lines.push(`Adding ${n}/${masterList.length} ⚠ unconfirmed  ${chunk[k]}  — ${r.error}`); }
+          done++;
+        }
+        if (lines.length) log(lines.join("\n"));
+        // Not clearly working: go back to adding through the page, one by one.
+        if (unsure > done / 2) { fastOff = true; log("⚠ Fast add is not getting clear answers — back to adding one by one."); }
+        if (slowDown && fastConc === 1) { fastOff = true; log("⚠ LazyApply keeps asking to slow down — back to adding one by one."); }
+        else if (slowDown) { fastConc = Math.max(1, fastConc >> 1); log(`  LazyApply asked to slow down — ${fastConc} at a time.`); await sleep(3000); }
+        i += done - 1;                 // the for-loop's i++ moves past the chunk
+        nextIndex = i + 1;
+        persistQueueState();
+        lastTickAt = Date.now();
+        updateStartLabel();
+        continue;
+      }
       try {
+        // Arm the recorder so this add teaches the fast path (page world).
+        if (!fastOff) {
+          try { await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: armAddRecorderInPage, args: [url] }); } catch (_) {}
+        }
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: addUrlToQueueInPage,
@@ -577,6 +699,13 @@
           if (r.confirmed) {
             added++;
             log(`Adding ${i + 1}/${masterList.length} ✓  ${url}`);
+            // Did the page's own request get recorded? Then go fast from here.
+            if (!fastOff && !fastReady) {
+              try {
+                const [st] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, world: "MAIN", func: armAddRecorderInPage, args: [""] });
+                if (st && st.result && st.result.ready) { fastReady = true; log("⚡ Fast add on — sending the rest straight to LazyApply, several at a time."); }
+              } catch (_) {}
+            }
           } else {
             // NOT proven queued within 30 s. Do NOT retry: the request may
             // still land, and a retry would queue the job twice. Slow down,
