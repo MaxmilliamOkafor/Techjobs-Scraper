@@ -9,25 +9,36 @@ const RESULTS_KEY = "hiringcafe_results";
 // Sites this extension can scrape. Add new sites here to extend support.
 const SITE_MATCHES = [
   "https://hiring.cafe/*", "https://*.hiring.cafe/*",
+  "https://hiringcafe.com/*", "https://*.hiringcafe.com/*",   // hiring.cafe now redirects here
+  "https://jobright.ai/*", "https://*.jobright.ai/*",
   "https://careerhound.io/*", "https://*.careerhound.io/*",
   "https://eurotoptech.com/*", "https://*.eurotoptech.com/*",
   "https://simplify.jobs/*", "https://*.simplify.jobs/*",
-  "https://hnhiring.com/*", "https://*.hnhiring.com/*"
+  "https://hnhiring.com/*", "https://*.hnhiring.com/*",
+  "https://www.linkedin.com/jobs/*", "https://indeed.com/*", "https://*.indeed.com/*",
+  "https://flexjobs.com/*", "https://*.flexjobs.com/*",
+  "https://notify.careers/*", "https://*.notify.careers/*"
 ];
-const SITE_HOST_RE = /(^|\.)(hiring\.cafe|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com)$/i;
+const SITE_HOST_RE = /(^|\.)(hiring\.cafe|hiringcafe\.com|jobright\.ai|careerhound\.io|eurotoptech\.com|simplify\.jobs|hnhiring\.com|linkedin\.com|indeed\.com|flexjobs\.com|notify\.careers)$/i;
 
 const FETCH_TIMEOUT_MS = 5000;
 const TAB_RESOLVE_TIMEOUT_MS = 8000;
 const TAB_POST_LOAD_QUIET_MS = 200;
 const TAB_MAX_REDIRECT_HOPS = 8;
-const MAX_CONCURRENT_TABS = 2;
+const MAX_CONCURRENT_TABS = 4;
+// Network lookups run in parallel, capped so a fast scrape can't flood one site
+// (each lookup's timeout only starts once it actually runs).
+const MAX_CONCURRENT_FETCHES = 24;
+const MAX_FETCHES_PER_HOST = 10;
 const DETAIL_LOAD_TIMEOUT_MS = 15000;
 const DETAIL_APPLY_POLL_INTERVAL_MS = 250;
 const DETAIL_APPLY_POLL_MAX_ATTEMPTS = 60;
-const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe"]);
+const REDIRECT_HOSTS = new Set(["hiring.cafe", "www.hiring.cafe", "hiringcafe.com", "www.hiringcafe.com"]);
 // simplify.jobs job links are /jobs/click/{id} — an HTTP 302 to the employer
 // ATS that must be followed in a tab (the cross-origin hop isn't fetch-readable).
 const CLICK_REDIRECT_HOSTS = new Set(["simplify.jobs", "www.simplify.jobs"]);
+// eurotoptech.com apply links are /api/jobs/apply/{id} — an HTTP redirect to the employer ATS.
+const ETT_HOST_RE = /(^|\.)eurotoptech\.com$/i;
 
 let state = {
   status: "idle", pageIndex: 0, totalPages: null,
@@ -70,36 +81,100 @@ async function persistState() {
   }, 60);
 }
 
+// Results are stored in chunks of CHUNK_ROWS rows ("hiringcafe_results_c0",
+// "…_c1", …) plus a small index ("…_meta"). Each save only writes the chunk
+// being filled, so saving stays fast even for runs of 100,000+ jobs (the old
+// single list was rewritten in full on every save). Needs "unlimitedStorage".
+const RESULTS_META_KEY = RESULTS_KEY + "_meta";
+const CHUNK_ROWS = 2000;
+const chunkKey = (i) => RESULTS_KEY + "_c" + i;
+const MAX_STORED_DESCRIPTION = 300;   // the CSV doesn't export it; keep a preview only
+let store = null;                     // { meta: { chunks, count }, last: rows of chunk meta.chunks-1 }
+async function loadStore() {
+  if (store) return store;
+  const got = await chrome.storage.local.get([RESULTS_META_KEY, RESULTS_KEY]);
+  let meta = got[RESULTS_META_KEY];
+  if (!meta) {
+    // One-time move of results saved by older versions into chunks.
+    const legacy = Array.isArray(got[RESULTS_KEY]) ? got[RESULTS_KEY] : [];
+    const writes = {};
+    meta = { chunks: 0, count: legacy.length };
+    for (let k = 0; k < legacy.length; k += CHUNK_ROWS) writes[chunkKey(meta.chunks++)] = legacy.slice(k, k + CHUNK_ROWS);
+    writes[RESULTS_META_KEY] = meta;
+    await chrome.storage.local.set(writes);
+    if (legacy.length) await chrome.storage.local.remove(RESULTS_KEY);
+  }
+  let last = [];
+  if (meta.chunks > 0) {
+    const k = chunkKey(meta.chunks - 1);
+    last = (await chrome.storage.local.get(k))[k] || [];
+  }
+  store = { meta, last };
+  return store;
+}
+async function resultCount() { return (await loadStore()).meta.count + pendingRows.length; }
+// All rows, read chunk by chunk. Exports read the chunks straight from storage
+// (see popup.js), so this is only for small callers.
 async function getResults() {
-  const stored = await chrome.storage.local.get(RESULTS_KEY);
-  return Array.isArray(stored[RESULTS_KEY]) ? stored[RESULTS_KEY] : [];
+  await flushRows();
+  const { meta } = await loadStore();
+  const keys = Array.from({ length: meta.chunks }, (_, i) => chunkKey(i));
+  const got = keys.length ? await chrome.storage.local.get(keys) : {};
+  return keys.flatMap((k) => got[k] || []);
 }
 let pendingRows = [];
 let rowFlushTimer = null;
 function bufferRow(row) {
+  if (row && typeof row.description === "string" && row.description.length > MAX_STORED_DESCRIPTION)
+    row.description = row.description.slice(0, MAX_STORED_DESCRIPTION) + "…";
   pendingRows.push(row);
   if (rowFlushTimer) return;
-  rowFlushTimer = setTimeout(flushRows, 200);
+  rowFlushTimer = setTimeout(flushRows, 400);
 }
-async function flushRows() {
-  rowFlushTimer = null;
+// Saves run one after another, never two at once.
+let flushChain = Promise.resolve();
+function flushRows() {
+  flushChain = flushChain.then(flushRowsNow, flushRowsNow);
+  return flushChain;
+}
+async function flushRowsNow() {
+  if (rowFlushTimer) { clearTimeout(rowFlushTimer); rowFlushTimer = null; }
   if (pendingRows.length === 0) return;
   const batch = pendingRows; pendingRows = [];
   try {
-    const results = await getResults();
-    for (const r of batch) results.push(r);
-    await chrome.storage.local.set({ [RESULTS_KEY]: results });
-    state.totalScraped = results.length;
+    const st = await loadStore();
+    const meta = { ...st.meta }, writes = {};
+    let last = st.last.slice();
+    if (meta.chunks === 0) meta.chunks = 1;
+    for (const r of batch) {
+      if (last.length >= CHUNK_ROWS) {
+        writes[chunkKey(meta.chunks - 1)] = last;      // full chunk: written once, never again
+        meta.chunks += 1; last = [];
+      }
+      last.push(r);
+    }
+    writes[chunkKey(meta.chunks - 1)] = last;
+    meta.count += batch.length;
+    writes[RESULTS_META_KEY] = meta;
+    await chrome.storage.local.set(writes);
+    store = { meta, last };
+    state.totalScraped = meta.count;
     persistState();
   } catch (e) {
     console.warn("flushRows failed", e);
     pendingRows = batch.concat(pendingRows);
+    if (!rowFlushTimer) rowFlushTimer = setTimeout(flushRows, 2000);
   }
 }
 async function clearResults() {
   pendingRows = [];
   if (rowFlushTimer) { clearTimeout(rowFlushTimer); rowFlushTimer = null; }
-  await chrome.storage.local.set({ [RESULTS_KEY]: [] });
+  await flushChain.catch(() => {});
+  const all = await chrome.storage.local.get(null);
+  const old = Object.keys(all).filter((k) => k === RESULTS_KEY || k.startsWith(RESULTS_KEY + "_c"));
+  if (old.length) await chrome.storage.local.remove(old);
+  store = { meta: { chunks: 0, count: 0 }, last: [] };
+  await chrome.storage.local.set({ [RESULTS_META_KEY]: store.meta });
   Object.assign(state, {
     totalScraped: 0, scrapedThisPage: 0, pageIndex: 0, totalPages: null,
     lastError: null, status: "idle", startedAt: null, finishedAt: null,
@@ -120,6 +195,18 @@ class Semaphore {
   }
 }
 const tabSem = new Semaphore(MAX_CONCURRENT_TABS);
+const fetchSem = new Semaphore(MAX_CONCURRENT_FETCHES);
+const hostSems = new Map();
+async function withFetchSlot(url, fn) {
+  const h = (() => { try { return new URL(url).host.toLowerCase(); } catch (_) { return ""; } })();
+  let hs = hostSems.get(h);
+  if (!hs) { hs = new Semaphore(MAX_FETCHES_PER_HOST); hostSems.set(h, hs); }
+  await hs.acquire();
+  try {
+    await fetchSem.acquire();
+    try { return await fn(); } finally { fetchSem.release(); }
+  } finally { hs.release(); }
+}
 
 function hostOf(url) { try { return new URL(url).host.toLowerCase(); } catch (_) { return ""; } }
 function isAggregator(url) { return REDIRECT_HOSTS.has(hostOf(url)); }
@@ -139,7 +226,8 @@ function cleanFinalUrl(u) {
   } catch (_) { return u; }
 }
 
-async function fetchFollow(url) {
+function fetchFollow(url) { return withFetchSlot(url, () => fetchFollowNow(url)); }
+async function fetchFollowNow(url) {
   if (cancelAll) return { ok: false, finalUrl: null, error: "cancelled" };
   const ctrl = new AbortController();
   activeAbortControllers.add(ctrl);
@@ -151,6 +239,8 @@ async function fetchFollow(url) {
       signal: ctrl.signal
     });
     clearTimeout(timer);
+    // Only the final URL is needed: stop downloading the page body.
+    try { ctrl.abort(); } catch (_) {}
     return { ok: true, finalUrl: resp.url || url };
   } catch (e) {
     clearTimeout(timer);
@@ -204,7 +294,8 @@ function extractApplyUrlFromHtml(html) {
   }
   return null;
 }
-async function resolveHiringCafeApplyUrl(detailUrl) {
+function resolveHiringCafeApplyUrl(detailUrl) { return withFetchSlot(detailUrl, () => resolveHiringCafeApplyUrlNow(detailUrl)); }
+async function resolveHiringCafeApplyUrlNow(detailUrl) {
   if (cancelAll) return { ok: false, finalUrl: null, error: "cancelled" };
   const ctrl = new AbortController();
   activeAbortControllers.add(ctrl);
@@ -322,7 +413,7 @@ function findApplyNowOnDetailPage(pollInterval, maxAttempts) {
       if (!href || !/^https?:/i.test(href)) return false;
       try {
         const u = new URL(href, window.location.href);
-        return !/(^|\.)hiring\.cafe$/i.test(u.host);
+        return !/(^|\.)(hiring\.cafe|hiringcafe\.com)$/i.test(u.host);
       } catch (_) { return false; }
     }
     function check() {
@@ -530,6 +621,12 @@ async function resolveJobUrl(initialUrl) {
     if (REDIRECT_HOSTS.has(startHost)) {
       const fast = await resolveHiringCafeApplyUrl(initialUrl);
       if (fast.ok && fast.finalUrl) {
+        // A link straight to a known ATS is already the employer's page: skip
+        // the extra round trip that only re-checks it for redirects.
+        if (ATS_HOST_RE.test(hostOf(fast.finalUrl))) {
+          state.fetchHits += 1;
+          return { ok: true, finalUrl: cleanFinalUrl(fast.finalUrl), applyInitial: fast.finalUrl, method: "detail-nextdata" };
+        }
         const ff = await fetchFollow(fast.finalUrl);
         const finalUrl = (ff.ok && ff.finalUrl && !isAggregator(ff.finalUrl)) ? ff.finalUrl : fast.finalUrl;
         state.fetchHits += 1;
@@ -545,7 +642,39 @@ async function resolveJobUrl(initialUrl) {
         state.fetchHits += 1;
         return { ok: true, finalUrl: cleanFinalUrl(cf.finalUrl), applyInitial: initialUrl, method: "click-fetch" };
       }
-      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "needs JS redirect"), method: "no-tab" };
+      // Fallback: the job's posting page (/p/<id>) — confirmed to load after the
+      // Sept 2026 redesign — embeds the job data, including where to apply.
+      // Pull the employer link out of its HTML the same way hiring.cafe's is.
+      const m = initialUrl.match(/\/jobs\/click\/([A-Za-z0-9-]+)/);
+      if (m && !cancelAll) {
+        const pf = await resolveHiringCafeApplyUrl("https://simplify.jobs/p/" + m[1]);
+        if (pf.ok && pf.finalUrl && !SITE_HOST_RE.test(hostOf(pf.finalUrl))) {
+          state.fetchHits += 1;
+          return { ok: true, finalUrl: cleanFinalUrl(pf.finalUrl), applyInitial: initialUrl, method: "posting-page" };
+        }
+      }
+      return { ok: false, finalUrl: initialUrl, applyInitial: initialUrl, error: "no-tab: " + (cf.error || "click redirect stayed on simplify; posting page had no apply link"), method: "no-tab" };
+    }
+
+    // eurotoptech.com — the dialog's "Apply" href is now an internal redirect
+    // endpoint (/api/jobs/apply/<id>) that 302s to the employer ATS. The page
+    // can't follow it (cross-origin), but the service worker can. If fetch ends
+    // up still on eurotoptech (e.g. a login/JS hop), follow it in a hidden tab.
+    if (ETT_HOST_RE.test(startHost)) {
+      const ef = await fetchFollow(initialUrl);
+      if (ef.ok && ef.finalUrl && !ETT_HOST_RE.test(hostOf(ef.finalUrl))) {
+        state.fetchHits += 1;
+        return { ok: true, finalUrl: cleanFinalUrl(ef.finalUrl), applyInitial: initialUrl, method: "ett-fetch" };
+      }
+      if (cancelAll) return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "cancelled", method: "none" };
+      await tabSem.acquire();
+      let tr;
+      try { tr = await resolveByTab(initialUrl); } finally { tabSem.release(); }
+      if (tr.ok && tr.finalUrl && !ETT_HOST_RE.test(hostOf(tr.finalUrl))) {
+        state.tabHits += 1;
+        return { ok: true, finalUrl: cleanFinalUrl(tr.finalUrl), applyInitial: initialUrl, method: "ett-tab" };
+      }
+      return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "eurotoptech apply link did not leave eurotoptech (" + (tr.error || ef.error || "stayed on site") + ")", method: "ett-unresolved" };
     }
 
     // Everything else — plain fetch with HTTP redirect following.
@@ -581,15 +710,30 @@ async function findTargetTab(preferTabId) {
 }
 function siteLabelFor(url) {
   const h = hostOf(url);
-  if (/hiring\.cafe$/i.test(h)) return "hiring.cafe";
+  if (/(hiring\.cafe|hiringcafe\.com)$/i.test(h)) return "hiring.cafe";
+  if (/jobright\.ai$/i.test(h)) return "jobright.ai";
   if (/careerhound\.io$/i.test(h)) return "careerhound.io";
   if (/eurotoptech\.com$/i.test(h)) return "eurotoptech.com";
   if (/simplify\.jobs$/i.test(h)) return "simplify.jobs";
   if (/hnhiring\.com$/i.test(h)) return "hnhiring.com";
+  if (/linkedin\.com$/i.test(h)) return "linkedin.com";
+  if (/indeed\.com$/i.test(h)) return "indeed.com";
+  if (/flexjobs\.com$/i.test(h)) return "flexjobs.com";
+  if (/notify\.careers$/i.test(h)) return "notify.careers";
   return h || null;
 }
 // Which content script handles a given tab. hnhiring.com is served by its own
 // dedicated handler; all other supported sites share content.js.
+// The MAIN-world page helper each site needs (reads data only the page can see).
+function mainHelperFor(url) {
+  const h = hostOf(url);
+  if (/jobright\.ai$/i.test(h)) return "jobright-main.js";
+  if (/careerhound\.io$/i.test(h)) return "ch-main.js";
+  if (/simplify\.jobs$/i.test(h)) return "sj-main.js";
+  if (/notify\.careers$/i.test(h)) return "notify-main.js";
+  if (/(hiring\.cafe|hiringcafe\.com)$/i.test(h)) return "fiber-main.js";
+  return null;
+}
 function contentScriptFor(url) {
   return /hnhiring\.com$/i.test(hostOf(url)) ? "hnhiring.js" : "content.js";
 }
@@ -599,14 +743,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     try {
       switch (msg?.type) {
         case "GET_STATE": {
-          await flushRows();
-          const results = await getResults();
-          sendResponse({ ok: true, state, resultCount: results.length });
+          sendResponse({ ok: true, state, resultCount: await resultCount() });
           return;
         }
         case "START_SCRAPE": {
           const target = await findTargetTab();
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search, an Indeed job search, a FlexJobs search or Notify (app.notify.careers/postings) in a tab first." }); return; }
           await clearResults();
           resetCancelFlag();
           state.status = "running";
@@ -615,9 +757,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           state.site = siteLabelFor(target.url);
           state.fetchHits = 0; state.tabHits = 0;
           persistState();
+          // Make sure the tab's MAIN-world page helper is there BEFORE the scrape
+          // starts. Chrome only adds it when a page loads, so a tab that was open
+          // before the extension was installed or updated has none, and the
+          // scraper can read nothing. Injecting on every Start is safe: each
+          // helper ignores a second copy of itself.
+          const helper = mainHelperFor(target.url);
+          if (helper) {
+            await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [helper], world: "MAIN" })
+              .catch((e) => console.warn("page helper inject failed", e));
+          }
           chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} })
             .catch(async () => {
               try {
+                // Content script missing too (tab predates the extension): add it.
                 await chrome.scripting.executeScript({ target: { tabId: target.id }, files: [contentScriptFor(target.url)] });
                 await chrome.tabs.sendMessage(target.id, { type: "BEGIN_SCRAPE", options: msg.options || {} });
               } catch (e2) {
@@ -642,7 +795,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case "CLEAR_RESULTS": { await clearResults(); sendResponse({ ok: true }); return; }
         case "RESOLVE_URL": { const r = await resolveJobUrl(msg.url); sendResponse(r); return; }
-        case "JOB_SCRAPED": { bufferRow(msg.row); sendResponse({ ok: true }); return; }
+        case "JOB_SCRAPED": {
+          // Apply links read straight off the page's own data count as "Fast" too.
+          if (msg.row && msg.row.status === "ok" && /page-data|list-data|list-api|jobs-api|job-page|body-link|apply-href|fiber/.test(msg.row.method || "")) {
+            state.fetchHits += 1; persistState();
+          }
+          bufferRow(msg.row); sendResponse({ ok: true }); return;
+        }
 
         case "PAGE_PROGRESS": {
           state.pageIndex = msg.pageIndex ?? state.pageIndex;
@@ -665,14 +824,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           return;
         }
         case "GET_RESULTS": {
-          await flushRows();
           const results = await getResults();
           sendResponse({ ok: true, results });
           return;
         }
+        // Save everything buffered, then tell the caller where the chunks are.
+        case "FLUSH_RESULTS": {
+          await flushRows();
+          const { meta } = await loadStore();
+          sendResponse({ ok: true, chunks: meta.chunks, count: meta.count, prefix: RESULTS_KEY + "_c" });
+          return;
+        }
         case "START_PICKER": {
           const target = await findTargetTab(msg.tabId);
-          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, careerhound.io, eurotoptech.com, simplify.jobs, or hnhiring.com in a tab first." }); return; }
+          if (!target) { sendResponse({ ok: false, error: "Open hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, a LinkedIn job search, an Indeed job search, a FlexJobs search or Notify (app.notify.careers/postings) in a tab first." }); return; }
           try { await chrome.tabs.sendMessage(target.id, { type: "START_PICKER", mode: msg.mode }); }
           catch (_) {
             try {
@@ -683,6 +848,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               return;
             }
           }
+          sendResponse({ ok: true });
+          return;
+        }
+        case "PICKER_CANCELLED": {
+          chrome.runtime.sendMessage({ type: "PICKER_CANCELLED", mode: msg.mode }).catch(() => {});
           sendResponse({ ok: true });
           return;
         }
