@@ -176,10 +176,14 @@
     aborted = false;
     const onListPage = !!document.querySelector("li.job");
     if (!onListPage) {
+      // The homepage has no jobs; they live on month pages. Name the real one.
+      const month = Array.from(document.querySelectorAll("a[href]")).map((a) => a.href).find((u) =>
+        /\/(january|february|march|april|may|june|july|august|september|october|november|december)-\d{4}\/?$/i.test(u));
       await send("SCRAPE_DONE", {
         error:
-          "No job list on this page. Open a monthly 'Who is hiring?' page " +
-          "(e.g. hnhiring.com/june-2026) and run again."
+          "No job list on this page. The homepage has none; jobs are on the monthly " +
+          "'Who is hiring?' pages" + (month ? " — open " + month : " (e.g. hnhiring.com/september-2026)") +
+          " and run again."
       });
       return;
     }
@@ -193,19 +197,20 @@
 
     const rows = scrapeHNHiring();
 
+    // Rows are final already (no lookups), so send them in parallel batches
+    // instead of waiting for each one to be acknowledged.
     let completed = 0;
-    for (const row of rows) {
-      if (aborted) break;
-      await send("JOB_SCRAPED", { row });
-      completed += 1;
-      if (completed % 10 === 0 || completed === rows.length) {
-        await send("PAGE_PROGRESS", {
-          pageIndex: 1,
-          totalPages: 1,
-          scrapedThisPage: completed,
-          status: "running"
-        });
-      }
+    const BATCH = 50;
+    for (let i = 0; i < rows.length && !aborted; i += BATCH) {
+      const chunk = rows.slice(i, i + BATCH);
+      await Promise.all(chunk.map((row) => send("JOB_SCRAPED", { row })));
+      completed += chunk.length;
+      await send("PAGE_PROGRESS", {
+        pageIndex: 1,
+        totalPages: 1,
+        scrapedThisPage: completed,
+        status: "running"
+      });
     }
 
     await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
