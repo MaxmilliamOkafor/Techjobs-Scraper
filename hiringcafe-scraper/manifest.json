@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tech Jobs URL Scraper",
-  "version": "2.18.0",
+  "version": "2.19.0",
   "description": "Scrapes job listings/apply URLs from hiring.cafe, jobright.ai, careerhound.io, eurotoptech.com, simplify.jobs, hnhiring.com, linkedin.com, indeed.com, flexjobs.com and notify.careers (Greenhouse/Lever/Ashby/Rippling). Imports CSV apply URLs into the LazyApply queue can show every job in the queue (auto Show More) with its URL, and can mass-delete jobs from the queue.",
   "permissions": [
     "tabs",
@@ -143,6 +143,17 @@
       ],
       "js": [
         "notify-main.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://eurotoptech.com/*",
+        "https://*.eurotoptech.com/*"
+      ],
+      "js": [
+        "ett-main.js"
       ],
       "world": "MAIN",
       "run_at": "document_start"

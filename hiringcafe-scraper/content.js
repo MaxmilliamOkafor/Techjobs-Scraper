@@ -778,140 +778,68 @@
 
   
 // ===================== eurotoptech.com adapter =====================
-// Layout as of Oct 2026: each job is an <article> card (title in <h3>, company,
-// "location · seniority · posted" line, comp line) with NO links on it. Clicking
-// the card opens a [role="dialog"] whose fields are a <dt>/<dd> list (Location,
-// Workplace, Seniority, Posted, Total comp, Yearly savings) and whose "Apply"
-// anchor href is already the employer/ATS destination. Pagination is a row of
-// plain buttons: "Previous", "page 1" (aria-current), "Go to page N", "Next".
-// The page also keeps a second, HIDDEN list (the other tab) in the DOM — with
-// its own articles and its own pager — so everything here is visible-only.
-const ETT_OPEN_DIALOG_TIMEOUT_MS = 6000;
-const ETT_CLOSE_DIALOG_TIMEOUT_MS = 4000;
-const ETT_PAGE_CHANGE_TIMEOUT_MS = 10000;
-const ETT_BETWEEN_CARDS_MS = 40;
-const ETT_APPLY_RE = /^\s*apply(\s+now)?\b/i;
-const ETT_CARD_SEL = "article";
+// v2.19 (Nov 2026): reads the job list straight from the site's own search API
+// (POST /api/jobs, 24 jobs a page) instead of opening every card's dialog, so a
+// 3,500-job search is read in seconds without touching the page.
+// Filters: taken from the page's own latest /api/jobs request (ett-main.js
+// listens for it), else rebuilt from the URL (?city=…&country=…&searchTerm=…).
+// Apply links (/api/jobs/apply/<id>) are followed by the background worker with
+// fetch only — no tabs are ever opened. EuroTopTech limits how many apply links
+// one account may open per hour/day; once it answers "limit reached" the scraper
+// stops requesting apply links and keeps the rest of the rows without a Job URL.
+const ETT_PAGE_CONCURRENCY = 4;
+const ETT_APPLY_CONCURRENCY = 6;
+const ETT_PAGE_RETRIES = 4;
+let ettFeedLimit = null;          // { retryAfter } once the job-feed limit is hit
 
 function ettIsTarget() {
   return /(^|\.)eurotoptech\.com$/i.test(location.hostname);
 }
-// A plain single click. clickAt() fires a synthetic click AND el.click(), which
-// on a pager button advances two pages and on a card can open then re-toggle.
-function ettClick(el) {
-  if (!el) return;
-  try { el.scrollIntoView({ block: "center", behavior: "auto" }); } catch (_) {}
-  try { el.click(); } catch (_) {}
-}
-function ettIsCard(el) {
-  return !!(el && el.matches && el.matches(ETT_CARD_SEL) && el.querySelector("h1,h2,h3,h4"));
-}
-function ettCardTitle(card) {
-  return card ? visibleText(card.querySelector("h3, h2, h4, h1") || card) : "";
-}
-// The visible "Showing N jobs" header of the list currently on screen.
-function ettListHeader() {
-  return Array.from(document.querySelectorAll("p, span, div, h2, h3, h4, h5, h6"))
-    .find((e) => e.children.length === 0 && /^(Showing|Previewing)\s[\d,]+(\sof\s[\d,]+)?\sjobs/i.test(visibleText(e)) && isVisible(e)) || null;
-}
-function ettGetCards(columnSpec) {
-  // A picked "Jobs Column": scrape the list that element belongs to.
-  if (columnSpec) {
-    const picked = findByElementSpec(columnSpec);
-    if (picked) {
-      const card = picked.closest(ETT_CARD_SEL);
-      // The card's list = nearest ancestor holding more than one card.
-      let scope = card ? card.parentElement : picked;
-      while (scope && scope !== document.body && scope.querySelectorAll(ETT_CARD_SEL).length < 2) scope = scope.parentElement;
-      if (scope) {
-        const within = Array.from(scope.querySelectorAll(ETT_CARD_SEL)).filter((c) => ettIsCard(c) && isVisible(c));
-        if (within.length) return within;
-      }
+function ettPageBody() {
+  return new Promise((resolve) => {
+    const nonce = "ett" + Math.random().toString(36).slice(2);
+    const t = setTimeout(() => { window.removeEventListener("message", onMsg); resolve(null); }, 400);
+    function onMsg(e) {
+      if (e.source !== window || !e.data || e.data.__ettRes !== nonce) return;
+      clearTimeout(t); window.removeEventListener("message", onMsg);
+      resolve(e.data.body || null);
     }
+    window.addEventListener("message", onMsg);
+    window.postMessage({ __ettReq: nonce }, "*");
+  });
+}
+function ettBodyFromUrl() {
+  const q = new URLSearchParams(location.search);
+  const list = (k) => (q.get(k) || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const filters = {};
+  if (list("city").length) filters.City = list("city");
+  if (list("country").length) filters.Country = list("country");
+  return {
+    search: q.get("searchTerm") || "", filters,
+    lifestylePreference: "Comfortable", sortColumn: "Posted Date", sortDirection: "desc",
+    techSearch: q.get("techSearch") || ""
+  };
+}
+async function ettFetchPage(base, page) {
+  const body = JSON.stringify({ ...base, page: String(page), groupIdentical: false });
+  let wait = 800;
+  for (let attempt = 0; attempt <= ETT_PAGE_RETRIES; attempt++) {
+    if (aborted) return null;
+    try {
+      const r = await fetch("/api/jobs", { method: "POST", headers: { "Content-Type": "application/json" }, body, credentials: "include" });
+      if (r.ok) return await r.json();
+      if (r.status === 429) {
+        // EuroTopTech caps how much of the feed one account may load per hour/day.
+        // A long Retry-After means that cap: stop instead of hammering it.
+        const ra = parseInt(r.headers.get("retry-after") || "", 10);
+        if (!(ra <= 60)) { ettFeedLimit = { retryAfter: ra || null }; return null; }
+        wait = Math.max(wait, ra * 1000);
+      }
+    } catch (_) {}
+    if (ettFeedLimit) return null;
+    await sleep(wait); wait *= 2;
   }
-  // Default: every visible card that follows the visible "Showing N jobs" header.
-  const all = Array.from(document.querySelectorAll(ETT_CARD_SEL)).filter((c) => ettIsCard(c) && isVisible(c));
-  const header = ettListHeader();
-  if (header) {
-    const after = all.filter((c) => header.compareDocumentPosition(c) & Node.DOCUMENT_POSITION_FOLLOWING);
-    if (after.length) return after;
-  }
-  return all;
-}
-function ettApplyLink(dlg) {
-  return Array.from(dlg.querySelectorAll("a[href]"))
-    .find((a) => ETT_APPLY_RE.test(visibleText(a)) && /^https?:/i.test(a.href || "")) || null;
-}
-function ettAnyDialog() {
-  return Array.from(document.querySelectorAll('[role="dialog"]')).find(isVisible) || null;
-}
-function ettGetDialog() {
-  const dlg = ettAnyDialog();
-  return dlg && ettApplyLink(dlg) ? dlg : null;
-}
-function ettCloseDialog() {
-  const dlg = ettAnyDialog();
-  if (!dlg) return;
-  const btn = dlg.querySelector('button[aria-label="Close job details"]') ||
-              dlg.querySelector('button[aria-label^="Close" i]') ||
-              Array.from(dlg.querySelectorAll("button")).find((b) => /^close$/i.test(visibleText(b)));
-  if (btn) { try { btn.click(); } catch (_) {} }
-  else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
-}
-async function ettWaitNoDialog() {
-  const start = Date.now();
-  while (Date.now() - start < ETT_CLOSE_DIALOG_TIMEOUT_MS) {
-    if (!ettAnyDialog()) return true;
-    await sleep(50);
-  }
-  return false;
-}
-// Field values: <dt>Label</dt><dd>Value</dd>. Falls back to the old
-// "label leaf followed by value leaf" scan in case the markup reverts.
-function ettFieldByLabel(dlg, ...labels) {
-  const want = labels.map((l) => l.toLowerCase());
-  for (const dt of dlg.querySelectorAll("dt")) {
-    if (!want.includes(visibleText(dt).toLowerCase())) continue;
-    let dd = dt.nextElementSibling;
-    while (dd && dd.tagName !== "DD" && dd.tagName !== "DT") dd = dd.nextElementSibling;
-    if (dd && dd.tagName === "DD") return visibleText(dd);
-  }
-  const leaves = Array.from(dlg.querySelectorAll("*")).filter((e) => e.children.length === 0);
-  for (let i = 0; i < leaves.length; i++) {
-    if (!want.includes(visibleText(leaves[i]).toLowerCase())) continue;
-    const box = leaves[i].parentElement;
-    const rest = box ? visibleText(box).slice(visibleText(leaves[i]).length).trim() : "";
-    if (rest) return rest;
-  }
-  return "";
-}
-function ettTitle(dlg) {
-  const h = dlg.querySelector("h2, h1, h3, .MuiTypography-h5");
-  return h ? visibleText(h) : "";
-}
-function ettCompany(dlg) {
-  const chip = dlg.querySelector(".MuiChip-label");
-  if (chip) return visibleText(chip);
-  // The company sits right under the title.
-  const h = dlg.querySelector("h2, h1, h3");
-  const sib = h && h.nextElementSibling;
-  const t = sib ? visibleText(sib) : "";
-  return t && t.length < 80 ? t : "";
-}
-function ettDescription(dlg) {
-  const head = Array.from(dlg.querySelectorAll("h2, h3, h4, h5, h6")).find((h) => /job description/i.test(visibleText(h)));
-  if (head) {
-    let n = head.nextElementSibling, out = "";
-    while (n && !/^H[1-6]$/.test(n.tagName)) { out += " " + visibleText(n); n = n.nextElementSibling; }
-    if (!out.trim() && head.parentElement) out = visibleText(head.parentElement).replace(/^\s*Job description\s*/i, "");
-    if (out.trim()) return out.trim();
-  }
-  let best = "";
-  for (const el of dlg.querySelectorAll("p, div")) {
-    const t = visibleText(el);
-    if (t.length > best.length && el.children.length <= 1 && !/Apply|Track/i.test(t.slice(0, 20))) best = t;
-  }
-  return best;
+  return null;
 }
 const ETT_TRACKING_RE = /^(utm_.*|ref|refid|src|source|referrer|trk|trackingid|gh_src)$/i;
 function ettCleanUrl(u) {
@@ -934,200 +862,125 @@ function ettProvider(u) {
   for (const [re, name] of map) if (re.test(h)) return name;
   return h.replace(/^www\./, "");
 }
-function ettBuildRow(dlg) {
-  const apply = ettApplyLink(dlg);
-  const applyUrl = apply ? ettCleanUrl(apply.href) : "";
+const ettEur = (n) => (typeof n === "number" && isFinite(n)) ? "€" + Math.round(n).toLocaleString("en-GB") : "";
+function ettRowFromJob(j) {
+  const pay = j.pay || {};
+  const comp = ettEur(pay.totalCompEur != null ? pay.totalCompEur : j.TotalCompEstimate);
+  const approx = pay.approx || j.compEstimateApprox;
+  const salary = comp ? comp + " total comp" + (pay.kind === "estimate" ? " (est" + (approx ? ", approx" : "") + ")" : "") : "";
+  const save = j.savingRate != null ? ettEur(j.savingRate) + " kept per year" : "";
+  const extra = [];
+  if (j.visaSponsorship) extra.push("visa sponsorship");
+  if (j.relocationSupport) extra.push("relocation support");
   return {
-    url: applyUrl,
-    ats_provider: applyUrl ? ettProvider(applyUrl) : "",
-    title: ettTitle(dlg),
-    company: ettCompany(dlg),
-    location: ettFieldByLabel(dlg, "Location"),
-    salary: ettFieldByLabel(dlg, "Total comp", "Total Compensation"),
-    work_mode: ettFieldByLabel(dlg, "Workplace", "Workplace Type"),
-    commitment: "",
-    yoe: ettFieldByLabel(dlg, "Seniority"),
-    posted_age: ettFieldByLabel(dlg, "Posted", "Posted Date"),
-    description: ettDescription(dlg),
-    skills: ettFieldByLabel(dlg, "Yearly savings", "Yearly Savings"),
-    job_posting_initial_url: apply ? apply.href : "",
+    url: "", ats_provider: "",
+    title: j["Job Title"] || "", company: j.Company || "",
+    location: j.Location || [j.City, j.Country].filter(Boolean).join(", "),
+    salary, work_mode: j["Workplace Type"] || "", commitment: "",
+    yoe: j.Seniority || "", posted_age: (j["Posted Date"] || "").slice(0, 10),
+    description: [j["Job Family"], j["Role Type"]].concat(extra).filter(Boolean).join(" · "),
+    skills: save,
+    job_posting_initial_url: j.jobId != null ? location.origin + "/api/jobs/apply/" + j.jobId : "",
     hiringcafe_viewall_url: location.href,
-    status: applyUrl ? "ok" : "no apply url found",
-    method: "apply-href",
-    scraped_at: new Date().toISOString()
+    status: "pending", method: "ett-api", scraped_at: new Date().toISOString()
   };
 }
-// The Apply href is now eurotoptech's own redirect (/api/jobs/apply/<id>), not
-// the ATS link. Hand it to the background worker, which follows the redirect to
-// the employer site. The scrape keeps clicking cards while lookups run (a few at
-// a time); rows are saved once resolved, and every lookup is awaited before the
-// scrape reports done. Unresolved rows get a blank Job URL, never an eurotoptech one.
-const ETT_MAX_PENDING_RESOLVES = 12;
-const ettPendingResolves = new Set();
+// Apply-link lookups: a small pool; stops for good once the account limit is hit.
+let ettLimit = null;               // { retryAfter } once EuroTopTech says the limit is reached
+const ettApplyPending = new Set();
 async function ettResolveAndSave(row) {
-  const initial = row.url;
-  if (initial && !isResolvedExternalUrl(initial)) {
-    const r = await send("RESOLVE_URL", { url: initial });
+  if (ettLimit || aborted) {
+    row.status = ettLimit ? "apply link not fetched: EuroTopTech apply-link limit reached" : "stopped";
+    row.method = "ett-api";
+  } else {
+    const r = await send("RESOLVE_URL", { url: row.job_posting_initial_url });
     if (r && r.ok && r.finalUrl && isResolvedExternalUrl(r.finalUrl)) {
       row.url = ettCleanUrl(r.finalUrl);
       row.ats_provider = ettProvider(row.url);
       row.status = "ok";
-      row.method = "apply-redirect:" + (r.method || "resolved");
+      row.method = "ett-api+apply-redirect";
+    } else if (r && r.rateLimited) {
+      if (!ettLimit) ettLimit = { retryAfter: r.retryAfter || null };
+      row.status = "apply link not fetched: EuroTopTech apply-link limit reached";
     } else {
-      row.url = "";
-      row.ats_provider = "";
       row.status = "unresolved: " + ((r && r.error) || "redirect lookup failed");
-      row.method = "apply-redirect:failed";
+      row.method = "ett-api+apply-failed";
     }
   }
   await send("JOB_SCRAPED", { row });
 }
 async function ettQueueRow(row) {
-  while (ettPendingResolves.size >= ETT_MAX_PENDING_RESOLVES) await Promise.race(ettPendingResolves);
-  const p = ettResolveAndSave(row).catch(() => {}).finally(() => ettPendingResolves.delete(p));
-  ettPendingResolves.add(p);
+  if (ettLimit || aborted || !row.job_posting_initial_url) return ettResolveAndSave(row);
+  while (ettApplyPending.size >= ETT_APPLY_CONCURRENCY) await Promise.race(ettApplyPending);
+  const p = ettResolveAndSave(row).catch(() => {}).finally(() => ettApplyPending.delete(p));
+  ettApplyPending.add(p);
 }
-async function ettDrainResolves() {
-  while (ettPendingResolves.size) await Promise.allSettled(Array.from(ettPendingResolves));
-}
-// Card-only fallback row (dialog failed to open): read what the card shows.
-function ettRowFromCard(card, status) {
-  const lines = Array.from(card.querySelectorAll(":scope > div")).map(visibleText).filter(Boolean);
-  const meta = (lines[1] || "").split(/\s*·\s*/);
-  return {
-    url: "", ats_provider: "", title: ettCardTitle(card), company: lines[0] || "",
-    location: meta[0] || "", salary: (lines[2] || "").split(/\s*·\s*/)[0] || "", work_mode: "", commitment: "",
-    yoe: meta.length > 2 ? meta[meta.length - 2] : "", posted_age: meta.length > 1 ? meta[meta.length - 1] : "",
-    description: "", skills: "", job_posting_initial_url: "", hiringcafe_viewall_url: location.href,
-    status, method: "card-only", scraped_at: new Date().toISOString()
-  };
-}
-function ettGetPagination() {
-  const btns = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(isVisible);
-  const label = (b) => (b.getAttribute("aria-label") || "").trim();
-  const next = btns.find((b) => /^next( page)?$/i.test(visibleText(b)) || /next page/i.test(label(b))) || null;
-  const curEl = btns.find((b) => /^(true|page)$/i.test(b.getAttribute("aria-current") || ""));
-  const curN = curEl ? parseInt(visibleText(curEl), 10) : NaN;
-  let total = null;
-  for (const b of btns) {
-    const m = label(b).match(/^(?:go to )?page\s+(\d+)$/i);
-    if (m) { const n = parseInt(m[1], 10); if (total == null || n > total) total = n; }
-  }
-  return { next, current: Number.isFinite(curN) ? curN : null, total };
-}
-function ettIsDisabled(el) {
-  return !el || el.disabled || el.getAttribute("aria-disabled") === "true" || /\bMui-disabled\b/.test(el.className || "");
-}
-async function ettWaitForCardChange(prevFirstTitle, columnSpec) {
-  const start = Date.now();
-  while (Date.now() - start < ETT_PAGE_CHANGE_TIMEOUT_MS) {
-    if (aborted) return false;
-    await sleep(80);
-    const t = ettCardTitle(ettGetCards(columnSpec)[0]);
-    if (t && t !== prevFirstTitle) { await sleep(150); return true; }
-  }
-  return false;
-}
-// Details and apply links may sit behind a membership. Signed out, opening a
-// card can show a membership prompt instead of the job. Recognise that and stop
-// rather than exporting a blank row per card. The job dialog itself mentions
-// paid features ("A Gold feature"), so a dialog WITH an Apply link never counts.
-let ettPaywalled = false;
-function ettIsPaywall(dlg) {
-  if (!dlg || ettApplyLink(dlg)) return false;
-  return /member|membership|subscri|upgrade|premium|unlock|sign ?up|log ?in|pricing|trial|gold/i.test(visibleText(dlg));
-}
-function ettDismissPaywall(dlg) {
-  const btn = Array.from(dlg.querySelectorAll('button, [role="button"], a')).find((b) =>
-    /maybe later|not now|no thanks|close|dismiss/i.test(((b.getAttribute && b.getAttribute("aria-label")) || "") + " " + visibleText(b)));
-  if (btn) { try { btn.click(); } catch (_) {} }
-  else document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
-}
-async function ettWaitDialogOrPaywall(expectTitle) {
-  const start = Date.now();
-  while (Date.now() - start < ETT_OPEN_DIALOG_TIMEOUT_MS) {
-    if (aborted) return {};
-    const dlg = ettGetDialog();
-    // Only accept the dialog for THIS card (never a stale one still closing).
-    if (dlg && (!expectTitle || ettTitle(dlg) === expectTitle || Date.now() - start > 2500)) return { dlg };
-    const any = ettAnyDialog();
-    if (any && Date.now() - start > 800 && ettIsPaywall(any)) return { paywall: any };
-    await sleep(50);
-  }
-  return {};
-}
-async function ettScrapePage(pageIndex, totalPages, columnSpec) {
-  const cards = ettGetCards(columnSpec);
-  await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: 0, status: "running" });
-  let completed = 0;
-  for (let i = 0; i < cards.length; i++) {
-    if (aborted) return;
-    const card = cards[i];
-    if (!document.body.contains(card)) continue;
-    if (ettAnyDialog()) { ettCloseDialog(); await ettWaitNoDialog(); }
-    const title = ettCardTitle(card);
-    // Click the title, not the card centre: the card also holds a
-    // "Not for me" hide button that must never be pressed.
-    ettClick(card.querySelector("h3, h2, h4") || card);
-    const opened = await ettWaitDialogOrPaywall(title);
-    if (opened.paywall) { ettDismissPaywall(opened.paywall); ettPaywalled = true; return; }
-    if (opened.dlg) {
-      await ettQueueRow(ettBuildRow(opened.dlg));
-      ettCloseDialog();
-      await ettWaitNoDialog();
-    } else {
-      await send("JOB_SCRAPED", { row: ettRowFromCard(card, "error: dialog did not open") });
-    }
-    completed += 1;
-    if (completed % 4 === 0 || completed === cards.length) {
-      await send("PAGE_PROGRESS", { pageIndex, totalPages, scrapedThisPage: completed, status: "running" });
-    }
-    await sleep(ETT_BETWEEN_CARDS_MS);
-  }
+function ettLimitText(kind, lim) {
+  const s = lim && lim.retryAfter;
+  const when = !s ? "within the hour (daily limit: midnight UTC)"
+    : s < 3600 ? "in about " + Math.ceil(s / 60) + " min"
+    : "in about " + Math.round(s / 3600) + " h (daily limit, resets at midnight UTC)";
+  return "EuroTopTech's per-account " + kind + " limit was reached; it resets " + when + ".";
 }
 async function ettRun(options) {
-  options = options || {};
-  const columnSpec = options.columnSpec || null;
   aborted = false;
-  ettPaywalled = false;
-  // The homepage is a marketing page; the job list lives at /jobs.
-  if ((location.pathname === "/" || location.pathname === "") && !ettListHeader()) {
-    await send("SCRAPE_DONE", { error: "This is EuroTopTech's homepage, which no longer lists jobs. Open eurotoptech.com/jobs and run again." });
+  ettLimit = null;
+  ettFeedLimit = null;
+  if (!/^\/jobs/.test(location.pathname)) {
+    await send("SCRAPE_DONE", { error: "Open eurotoptech.com/jobs (with your filters) and run again." });
     return;
   }
-  if (!ettGetCards(columnSpec).length) {
-    const start = Date.now();
-    while (Date.now() - start < PAGE_RENDER_TIMEOUT_MS && !ettGetCards(columnSpec).length) await sleep(150);
+  const captured = await ettPageBody();
+  const base = { ...(captured || ettBodyFromUrl()) };
+  delete base.page; delete base.newSinceStamp;
+
+  const first = await ettFetchPage(base, 1);
+  if (!first || !Array.isArray(first.jobs)) {
+    await send("SCRAPE_DONE", { error: aborted ? "stopped by user" : ettFeedLimit ? ettLimitText("job-feed", ettFeedLimit) : "EuroTopTech's job search didn't answer. Reload the page and run again." });
+    return;
   }
-  if (!ettGetCards(columnSpec).length) { await send("SCRAPE_DONE", { error: "No job cards found on the eurotoptech page." }); return; }
-  let guard = 0;
-  const seenPages = new Set();
-  while (!aborted) {
-    guard += 1;
-    const pag = ettGetPagination();
-    const pageIndex = pag.current ?? guard;
-    if (seenPages.has(pageIndex)) break;           // pager looped back: done
-    seenPages.add(pageIndex);
-    const totalPages = pag.total;
-    const prevFirstTitle = ettCardTitle(ettGetCards(columnSpec)[0]);
-    await ettScrapePage(pageIndex, totalPages, columnSpec);
-    if (ettPaywalled) {
-      await ettDrainResolves();
-      await send("SCRAPE_DONE", { error: "EuroTopTech showed a membership prompt instead of the job details. Log in with a member account, open eurotoptech.com/jobs, and run again." });
-      return;
+  const totalPages = Math.max(1, first.totalPages || 1);
+  const seen = new Set();
+  let done = 1;   // last page whose rows were read
+  const failed = [];
+  const handle = async (data) => {
+    for (const j of (data && data.jobs) || []) {
+      if (aborted) return;
+      if (j.jobId != null && seen.has(j.jobId)) continue;
+      if (j.jobId != null) seen.add(j.jobId);
+      await ettQueueRow(ettRowFromJob(j));
     }
-    if (aborted) break;
-    // A picked pagination button wins; otherwise the visible "Next" button.
-    let next = options.paginationSpec ? findByElementSpec(options.paginationSpec) : null;
-    if (!next || ettIsDisabled(next)) next = ettGetPagination().next;
-    if (ettIsDisabled(next)) break;
-    ettClick(next);
-    await sleep(POST_CLICK_GRACE_MS);
-    const changed = await ettWaitForCardChange(prevFirstTitle, columnSpec);
-    if (!changed) break;
-  }
-  await ettDrainResolves();
-  await send("SCRAPE_DONE", aborted ? { error: "stopped by user" } : {});
+  };
+  await send("PAGE_PROGRESS", { pageIndex: 1, totalPages, scrapedThisPage: first.jobs.length, status: "running" });
+  await handle(first);
+
+  // Remaining pages, a few at a time; rows are handed over in page order.
+  let nextPage = 2;
+  const results = new Map();
+  let emitPage = 2;
+  const worker = async () => {
+    while (!aborted && !ettFeedLimit && nextPage <= totalPages) {
+      const p = nextPage++;
+      const data = await ettFetchPage(base, p);
+      results.set(p, data);
+      while (results.has(emitPage)) {
+        const d = results.get(emitPage); results.delete(emitPage);
+        const pg = emitPage++;
+        if (!d) { if (!ettFeedLimit) failed.push(pg); }
+        else { await handle(d); done = pg; }
+        await send("PAGE_PROGRESS", { pageIndex: pg, totalPages, scrapedThisPage: d && d.jobs ? d.jobs.length : 0, status: "running" });
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: ETT_PAGE_CONCURRENCY }, worker));
+  while (ettApplyPending.size) await Promise.allSettled(Array.from(ettApplyPending));
+
+  if (aborted) { await send("SCRAPE_DONE", { error: "stopped by user" }); return; }
+  const notes = [];
+  if (ettFeedLimit) notes.push("Stopped after page " + Math.max(1, done) + " of " + totalPages + ": " + ettLimitText("job-feed", ettFeedLimit));
+  if (failed.length) notes.push("Pages that failed to load and were skipped: " + failed.join(", ") + ".");
+  if (ettLimit) notes.push(ettLimitText("apply-link", ettLimit) + " Rows after that point have no Job URL.");
+  await send("SCRAPE_DONE", notes.length ? { error: notes.join(" ") } : {});
 }
 // =================== end eurotoptech.com adapter ===================
 

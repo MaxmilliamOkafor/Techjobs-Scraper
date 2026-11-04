@@ -239,9 +239,10 @@ async function fetchFollowNow(url) {
       signal: ctrl.signal
     });
     clearTimeout(timer);
+    const retryAfter = parseInt(resp.headers.get("retry-after") || "", 10) || null;
     // Only the final URL is needed: stop downloading the page body.
     try { ctrl.abort(); } catch (_) {}
-    return { ok: true, finalUrl: resp.url || url };
+    return { ok: true, finalUrl: resp.url || url, status: resp.status, retryAfter };
   } catch (e) {
     clearTimeout(timer);
     return {
@@ -660,21 +661,18 @@ async function resolveJobUrl(initialUrl) {
     // endpoint (/api/jobs/apply/<id>) that 302s to the employer ATS. The page
     // can't follow it (cross-origin), but the service worker can. If fetch ends
     // up still on eurotoptech (e.g. a login/JS hop), follow it in a hidden tab.
+    // Fetch only — never a tab: when the link doesn't leave eurotoptech it's an
+    // error/limit page ("Apply link unavailable"), which a tab can't fix either.
     if (ETT_HOST_RE.test(startHost)) {
       const ef = await fetchFollow(initialUrl);
       if (ef.ok && ef.finalUrl && !ETT_HOST_RE.test(hostOf(ef.finalUrl))) {
         state.fetchHits += 1;
         return { ok: true, finalUrl: cleanFinalUrl(ef.finalUrl), applyInitial: initialUrl, method: "ett-fetch" };
       }
-      if (cancelAll) return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "cancelled", method: "none" };
-      await tabSem.acquire();
-      let tr;
-      try { tr = await resolveByTab(initialUrl); } finally { tabSem.release(); }
-      if (tr.ok && tr.finalUrl && !ETT_HOST_RE.test(hostOf(tr.finalUrl))) {
-        state.tabHits += 1;
-        return { ok: true, finalUrl: cleanFinalUrl(tr.finalUrl), applyInitial: initialUrl, method: "ett-tab" };
+      if (ef.status === 429) {
+        return { ok: false, finalUrl: null, applyInitial: initialUrl, rateLimited: true, retryAfter: ef.retryAfter || null, error: "eurotoptech apply-link limit reached", method: "ett-limit" };
       }
-      return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "eurotoptech apply link did not leave eurotoptech (" + (tr.error || ef.error || "stayed on site") + ")", method: "ett-unresolved" };
+      return { ok: false, finalUrl: null, applyInitial: initialUrl, error: "eurotoptech apply link unavailable (" + (ef.error || ("HTTP " + ef.status)) + ")", method: "ett-unresolved" };
     }
 
     // Everything else — plain fetch with HTTP redirect following.
